@@ -12,6 +12,7 @@
 #include <netinet/tcp.h>
 
 #include <sys/epoll.h>
+#include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -2050,6 +2051,12 @@ static void main_loop()
 
     while (!done)
     {
+        // Collect services that have exited, so that they don't stay
+        // around as zombie processes. The services are the only child
+        // processes a314d starts.
+        while (waitpid(-1, NULL, WNOHANG) > 0)
+            ;
+
         struct epoll_event ev;
         int n = epoll_pwait(epfd, &ev, 1, 1000, &original_sigset);
         if (n == -1)
