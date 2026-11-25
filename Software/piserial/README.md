@@ -7,12 +7,12 @@ program that lets you choose the serial device can use them: terminal
 programs such as NComm or Term, or programs that talk to a device over a
 serial line.
 
-There are four units, 0 to 3. Each unit is one Pi port, chosen in the
-Serial tool in Prefs/A314 (still to come). Until a unit has a port, it
-uses the first free one, so with a single adapter nothing needs setting
-up. The port is remembered by the name Linux gives it in
-`/dev/serial/by-id`, so it is still found when it is plugged into another
-USB socket or the adapters are plugged in in another order. A port that is
+There are four units, 0 to 3. Each unit is one Pi port, chosen with the
+Serial tool in Prefs/A314. Until a unit has a port, it uses the first free
+one, so with a single adapter nothing needs setting up. The port is
+remembered by the name Linux gives it in `/dev/serial/by-id`, so it is
+still found when it is plugged into another USB socket or the adapters are
+plugged in in another order. A port that is
 unplugged while in use is opened again when it comes back; until then the
 unit reports that the carrier is gone.
 
@@ -23,8 +23,26 @@ runs a314d must be able to use serial ports (on Raspberry Pi OS the first
 user is in the `dialout` group, which is enough).
 
 On the Amiga, copy `a314serial.device` from `bin_amiga/Devs` (made by
-`make -f Makefile-amiga`) to DEVS:. Then, in your program, choose
-`a314serial.device` instead of `serial.device`, and the unit number.
+`make -f Makefile-amiga`) to DEVS:, and the `Prefs/A314` drawer to SYS:Prefs.
+Then, in your program, choose `a314serial.device` instead of
+`serial.device`, and the unit number.
+
+## Choosing the ports
+
+Open the A314 drawer in Prefs and double-click Serial. It lists the units
+and asks the Pi which serial ports it has. Click a unit to step through the
+ports (and "Automatic", the first free port). A port that is in use is
+marked as such; one that was chosen but isn't plugged in is marked as not
+connected and keeps its place. Rescan asks the Pi again, for instance after
+plugging in an adapter.
+
+As with the Workbench's own preferences editors, Use keeps the settings
+until the Amiga is restarted and Save keeps them for good. They are the
+environment variables `A314/SerialUnit0` to `A314/SerialUnit3`, which hold
+the port's name, or `auto`; Save also puts them in ENVARC: (on Workbench
+1.3, which has no ENVARC:, in SYS:Prefs/Env-Archive, where
+a314serial.device also looks). A unit that is open keeps its port until it
+is closed.
 
 ## Settings
 

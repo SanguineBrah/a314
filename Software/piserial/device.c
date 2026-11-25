@@ -6,8 +6,8 @@
  * autodoc), so programs that let you choose the serial device, such as
  * terminal programs, can use it. Each unit is one Pi serial port, chosen
  * with Prefs/A314/Serial, which stores the port's name in the environment
- * variable A314/SerialUnit<n> (unit 0 to 3). Without it, a unit uses the
- * first free port.
+ * variable A314/SerialUnit<n> (unit 0 to 3). Without it, or with "auto",
+ * a unit uses the first free port.
  *
  * Each open unit is a connection to the piserial service on the Pi; see
  * piserial.py for the messages. Only the commands of serial.device are
@@ -911,16 +911,25 @@ static void handle_request(struct IOExtSer *ior)
 	send_next(u);
 }
 
-/* Reads ENV:A314/SerialUnit<n>, the port chosen for the unit (outside
-   Forbid: this uses DOS) */
+/* Reads the port chosen for the unit (in Prefs/A314/Serial) from the
+   environment variable A314/SerialUnit<n>: from ENV:, or if it isn't
+   there (on Workbench 1.3, ENV: starts empty) from where it is saved.
+   Outside Forbid: this uses DOS. */
 static void read_port_name(struct SerUnit *u)
 {
-	char name[] = "ENV:A314/SerialUnit0";
-	BPTR fh;
+	static const char *const dirs[] = { "ENV:", "ENVARC:", "SYS:Prefs/Env-Archive/" };
+	char name[48];
+	BPTR fh = 0;
 	LONG n = 0, i;
 
-	name[sizeof(name) - 2] = '0' + u->number;
-	fh = Open(name, MODE_OLDFILE);
+	for (i = 0; i < 3 && !fh; i++)
+	{
+		char *p = put_str(name, dirs[i]);
+		p = put_str(p, "A314/SerialUnit");
+		*p++ = '0' + u->number;
+		*p = '\0';
+		fh = Open(name, MODE_OLDFILE);
+	}
 	if (fh)
 	{
 		n = Read(fh, u->port, sizeof(u->port) - 1);
