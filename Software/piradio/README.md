@@ -1,9 +1,11 @@
 # PiRadio
 
 PiRadio turns an RTL-SDR dongle plugged into the Raspberry Pi into a radio
-that you tune from the Workbench. The Amiga program opens a window with a
-tuning dial, band buttons, and sliders for volume, squelch and RF gain. The
-sound is played on the Amiga by [PiAudio](../piaudio/README.md).
+that you tune from the Amiga. The Amiga program shows a radio set on its own
+screen, with a tuning dial, a frequency display, a level meter, band keys,
+and knobs for volume, squelch and RF gain. With the WINDOW ToolType it opens
+in a window on the Workbench instead. The sound is played on the Amiga by
+[PiAudio](../piaudio/README.md).
 
 ## Requirements
 
@@ -29,10 +31,17 @@ run >NIL: PiAudio
 PiRadio
 ```
 
-PiRadio opens its window straight away and connects to the Pi in the
-background, retrying until the service answers. The radio starts on the band
-and frequency used last time. Close the window, or press Esc or Q, to quit;
-the Pi then stops `rtl_fm`.
+PiRadio opens straight away and connects to the Pi in the background,
+retrying until the service answers. The radio starts on the band and
+frequency used last time. Press POWER (or close the window), or press Esc
+or Q, to quit; the Pi then stops `rtl_fm`. TO WB (or W) puts the radio's
+screen behind the Workbench, and it carries on playing; bring it back with
+the screen's depth gadget or Left-Amiga+M.
+
+PiRadio needs about 210 KB of chip memory for its screen and pictures. To
+have it in a window on the Workbench instead, add the ToolType `WINDOW` to
+its icon (select the icon and choose Information from the Icons menu), or
+start it from the shell with `PiRadio WINDOW`.
 
 While PiRadio is running, the piradio service has the piaudio pipe open, so
 other programs on the Pi should not play sound to the Amiga at the same
@@ -40,15 +49,19 @@ time.
 
 ## Controls
 
-- Click or drag on the dial to tune. The marks under the scale are the
-  active channels found by the last sweep.
-- The band buttons select a band. The line under a button shows the current
-  band.
+- Click or drag on the dial to tune, or turn the TUNING knob: drag it
+  round, or click on its left or right side for one step. The marks under
+  the scale are the active channels found by the last sweep.
+- The band keys select a band. (In the window, the line under a button
+  shows the current band.)
+- Drag the VOL, SQL and GAIN knobs up or down (in the window, the sliders).
 - SEEK goes to the next active channel down or up. SCAN steps through the
   active channels until it is pressed again. With the squelch off, it stays
   on each channel for `scan_dwell_seconds`. With the squelch on, it stays
   while there is a signal, and moves on after `scan_hang_seconds` of quiet.
-- REGION steps to the next region's band list (see Configuration).
+- REGION steps to the next region's band list (see Configuration). The
+  region is shown in the message strip (in the window, next to the meter).
+- HELP shows the keyboard shortcuts on the dial.
 - SWEEP looks for active channels again. Seek and scan sweep the band with
   `rtl_power` when there is no recent sweep, and scan sweeps again each
   time it reaches the end of the band. Audio stops for the second or two a
@@ -68,6 +81,8 @@ time.
 | v / V               | Volume down/up                                 |
 | s / S               | Squelch down/up                                |
 | g / G, a            | RF gain down/up, automatic gain                |
+| Help or ?           | Show or hide the keyboard shortcuts            |
+| W                   | Put the radio's screen behind the Workbench    |
 | Esc or Q            | Quit (Esc first cancels a frequency entry)     |
 
 ## Configuration
@@ -110,10 +125,17 @@ piradio		/opt/a314/venv/bin/python3	/opt/a314/piradio.py
 
 ## Problems
 
-Messages from the service are shown at the bottom of the window, for
+Messages from the service are shown in the message strip under the dial,
+or at the bottom of the window, for
 example when no dongle is found or the dongle is in use by another program.
 The service retries every few seconds, so plugging the dongle in is enough.
 The service logs to the a314d journal: `journalctl -u a314d`.
 
 The service and the Amiga program exchange text lines over the a314 stream
 `piradio`. The commands are listed at the top of `piradio.py`.
+
+The Amiga program is in four parts: `piradio.c` (the connection to the Pi
+and the actions), `panel.c` (the radio on its own screen), `window.c` (the
+radio in a window) and `piradio_art.c`, the pictures for the screen.
+`piradio_art.c` and `piradio_art.h` are made by `python3 make_art.py`, which
+draws them; give it the name of a PNG file to get a preview as well.

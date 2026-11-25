@@ -41,9 +41,10 @@ ${BIN}/C/PiAudio: a314device/a314.h a314device/proto_a314.h piaudio/piaudio.c
 	${VC} piaudio/piaudio.c -lamiga -o ${BIN}/C/PiAudio
 
 all: ${BIN}/Utilities/PiRadio
-${BIN}/Utilities/PiRadio: a314device/a314.h piradio/piradio.c piradio/PiRadio.info
+PIRADIO_SRC = piradio/piradio.c piradio/panel.c piradio/window.c piradio/piradio_art.c
+${BIN}/Utilities/PiRadio: a314device/a314.h piradio/piradio.h piradio/piradio_art.h ${PIRADIO_SRC} piradio/PiRadio.info
 	mkdir -p ${BIN}/Utilities
-	${VC} piradio/piradio.c -lamiga -o ${BIN}/Utilities/PiRadio
+	${VC} ${PIRADIO_SRC} -lamiga -o ${BIN}/Utilities/PiRadio
 	cp piradio/PiRadio.info ${BIN}/Utilities/PiRadio.info
 
 ${BIN}/C/RemoteMouse: a314device/a314.h remote-mouse/remote-mouse.c
