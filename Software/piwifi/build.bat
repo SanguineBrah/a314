@@ -1,1 +1,1 @@
-vc piwifi.c -lamiga -o PiWiFi
+vc piwifi.c -lamiga -o WiFi

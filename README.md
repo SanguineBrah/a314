@@ -53,7 +53,7 @@ You may also launch Interactive applications using the pi command, such as `pi m
 
 - [*PiAudio*](Software/piaudio) lets the RPi stream audio samples directly to the shared chip memory, from where Paula plays those samples. PiAudio is integrated with [ALSA](https://www.alsa-project.org) on the RPi so that any program that plays audio through ALSA can be used, i.e. "pi mpg123 -a amiga song.mp3" plays song.mp3 using the program mpg123 to the Amiga.
 
-- [*PiWiFi*](Software/piwifi) lets you choose the WiFi network the RPi connects to from the Workbench. A change that leaves the RPi without network access is undone automatically.
+- [*PiWiFi*](Software/piwifi) (WiFi in Prefs/A314) lets you choose the WiFi network the RPi connects to from the Workbench. A change that leaves the RPi without network access is undone automatically.
 
 - [*RemoteWB*](Software/remotewb) works by moving the Workbench bitplanes over to the chip memory on the A314. This requires that the A500 has at least a 8372 Agnus. During drawing of each frame on the Amiga, the RPi reads those bitplanes, encodes them into a [GIF image](Software/bpls2gif), and transmits that image to a web browser through a web socket. The web browser in turn, returns key presses and mouse movements back to the Amiga through the same web socket. In effect, this becomes a web browser based remote control application, comparable to VNC but with near zero performance impact on the Amiga CPU!
 

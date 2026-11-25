@@ -1,6 +1,6 @@
 # PiWiFi
 
-PiWiFi lets you choose the WiFi network the Raspberry Pi connects to, from
+PiWiFi (the WiFi tool in Prefs/A314) lets you choose the WiFi network the Raspberry Pi connects to, from
 the Workbench. It shows the Pi's current connection and the networks the Pi
 can see, and connects to a network or forgets a saved one.
 
@@ -15,8 +15,8 @@ can see, and connects to a network or forgets a saved one.
 
 ## Using PiWiFi
 
-Copy *PiWiFi* and *PiWiFi.info* to a drawer and double-click the icon (or
-start `PiWiFi` from the shell). It asks the Pi for its connection and scans for networks,
+Copy the Prefs/A314 drawer from `bin_amiga` (made by `make -f
+Makefile-amiga`) to SYS:Prefs, open it and double-click WiFi. It asks the Pi for its connection and scans for networks,
 which takes a few seconds. In the list, `*` marks the network in use and
 `S` the networks the Pi has saved.
 
