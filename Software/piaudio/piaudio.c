@@ -4,9 +4,15 @@
 #include <libraries/dos.h>
 
 #include <devices/audio.h>
+#include <intuition/intuition.h>
+#include <workbench/startup.h>
+#include <workbench/workbench.h>
 
 #include <proto/alib.h>
 #include <proto/exec.h>
+#include <proto/dos.h>
+#include <proto/intuition.h>
+#include <proto/icon.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -70,6 +76,15 @@ struct IOAudio *sync_audio_req = NULL;
 struct IOAudio *async_audio_req[4] = { NULL, NULL, NULL, NULL };
 
 ULONG allocated_channels;
+
+struct IntuitionBase *IntuitionBase = NULL;
+struct Library *IconBase = NULL;
+
+/* Set by the startup code when started from Workbench */
+extern struct WBStartup *_WBenchMsg;
+
+#define PORT_NAME "PiAudio"	/* marks that PiAudio is running */
+struct MsgPort *marker_port = NULL;
 
 BOOL use_ahi = FALSE;
 BOOL ahi_device_open = FALSE;
@@ -154,6 +169,55 @@ void submit_async_audio_req(int index)
 	BeginIO((struct IORequest *)async_audio_req[index]);
 }
 
+/* Shows a message in the shell, or in a requester when started from
+   Workbench (where there is no shell). With no, asks a question and
+   returns TRUE for yes. */
+BOOL show(const char *text, const char *yes, const char *no)
+{
+	struct IntuiText body = { 0, 1, JAM2, 16, 8, NULL, (UBYTE *)text, NULL };
+	struct IntuiText pos = { 0, 1, JAM2, 6, 3, NULL, (UBYTE *)yes, NULL };
+	struct IntuiText neg = { 0, 1, JAM2, 6, 3, NULL, (UBYTE *)no, NULL };
+
+	if (!_WBenchMsg)
+	{
+		printf("%s\n", text);
+		return FALSE;
+	}
+	if (!IntuitionBase)
+		IntuitionBase = (struct IntuitionBase *)OpenLibrary("intuition.library", 0);
+	if (!IntuitionBase)
+		return FALSE;
+	return AutoRequest(NULL, &body, no ? &pos : NULL, no ? &neg : &pos, 0, 0,
+		8 * strlen(text) + 48, 54);
+}
+
+void report(const char *text)
+{
+	show(text, "OK", NULL);
+}
+
+/* Reads the options from the icon's ToolTypes, when started from
+   Workbench: AHI selects AHI output. */
+void read_tooltypes()
+{
+	struct WBArg *arg = _WBenchMsg->sm_ArgList;
+	struct DiskObject *icon;
+	BPTR old_dir;
+
+	IconBase = OpenLibrary("icon.library", 0);
+	if (!IconBase)
+		return;
+	old_dir = CurrentDir(arg->wa_Lock);
+	icon = GetDiskObject(arg->wa_Name);
+	if (icon)
+	{
+		if (FindToolType((STRPTR *)icon->do_ToolTypes, (STRPTR)"AHI"))
+			use_ahi = TRUE;
+		FreeDiskObject(icon);
+	}
+	CurrentDir(old_dir);
+}
+
 /* Plays buffer index (0 or 2) through AHI. AHI wants the left and right
    samples interleaved, so they are copied into ahi_buffers first. */
 void submit_ahi_req(int index)
@@ -194,7 +258,7 @@ BOOL open_paula()
 	sync_audio_req = (struct IOAudio *)CreateExtIO(sync_mp, sizeof(struct IOAudio));
 	if (!sync_audio_req)
 	{
-		printf("Unable to allocate sync audio request\n");
+		report("Unable to allocate sync audio request");
 		return FALSE;
 	}
 
@@ -203,7 +267,7 @@ BOOL open_paula()
 		async_audio_req[i] = AllocMem(sizeof(struct IOAudio), MEMF_PUBLIC);
 		if (!async_audio_req[i])
 		{
-			printf("Unable to allocate async audio request\n");
+			report("Unable to allocate async audio request");
 			return FALSE;
 		}
 	}
@@ -220,7 +284,7 @@ BOOL open_paula()
 
 	if (OpenDevice(AUDIONAME, 0, (struct IORequest *)sync_audio_req, 0))
 	{
-		printf("Unable to open audio.device\n");
+		report("Unable to open audio.device");
 		return FALSE;
 	}
 
@@ -245,7 +309,7 @@ BOOL open_ahi()
 		ahi_buffers[i] = AllocMem(SAMPLES * 2, MEMF_PUBLIC | MEMF_CLEAR);
 		if (!ahi_req[i] || !ahi_buffers[i])
 		{
-			printf("Unable to allocate memory for AHI\n");
+			report("Unable to allocate memory for AHI");
 			return FALSE;
 		}
 	}
@@ -253,7 +317,7 @@ BOOL open_ahi()
 	ahi_req[0]->ahir_Version = 4;
 	if (OpenDevice(AHINAME, AHI_DEFAULT_UNIT, (struct IORequest *)ahi_req[0], 0))
 	{
-		printf("Unable to open ahi.device (AHI needs Kickstart 2.04 or later)\n");
+		report("Unable to open ahi.device (AHI needs Kickstart 2.04 or later)");
 		return FALSE;
 	}
 	ahi_device_open = TRUE;
@@ -265,25 +329,50 @@ int main(int argc, char **argv)
 {
 	LONG old_priority = SetTaskPri(FindTask(NULL), 50);
 
-	if (argc == 2 && (strcmp(argv[1], "AHI") == 0 || strcmp(argv[1], "ahi") == 0))
+	if (_WBenchMsg)
+		read_tooltypes();
+	else if (argc == 2 && (strcmp(argv[1], "AHI") == 0 || strcmp(argv[1], "ahi") == 0))
 		use_ahi = TRUE;
 	else if (argc > 1)
 	{
-		printf("Usage: piaudio [AHI]\n");
+		report("Usage: piaudio [AHI]");
 		return 10;
+	}
+
+	/* Only one PiAudio at a time. From Workbench, starting it again
+	   offers to stop the one that is running. */
+	struct MsgPort *other;
+	Forbid();
+	other = FindPort(PORT_NAME);
+	if (!other)
+		marker_port = CreatePort(PORT_NAME, 0);
+	Permit();
+	if (other)
+	{
+		if (!_WBenchMsg)
+			printf("PiAudio is already running\n");
+		else if (show("PiAudio is already running. Stop it?", "Stop", "Cancel"))
+		{
+			Forbid();
+			other = FindPort(PORT_NAME);
+			if (other)
+				Signal(other->mp_SigTask, SIGBREAKF_CTRL_C);
+			Permit();
+		}
+		goto cleanup;
 	}
 
 	sync_mp = CreatePort(NULL, 0);
 	if (!sync_mp)
 	{
-		printf("Unable to create sync reply message port\n");
+		report("Unable to create sync reply message port");
 		goto cleanup;
 	}
 
 	async_mp = CreatePort(NULL, 0);
 	if (!async_mp)
 	{
-		printf("Unable to create async reply message port\n");
+		report("Unable to create async reply message port");
 		goto cleanup;
 	}
 
@@ -291,13 +380,13 @@ int main(int argc, char **argv)
 	write_a314_req = (struct A314_IORequest *)CreateExtIO(sync_mp, sizeof(struct A314_IORequest));
 	if (!sync_a314_req || !write_a314_req)
 	{
-		printf("Unable to create A314_IORequest\n");
+		report("Unable to create A314_IORequest");
 		goto cleanup;
 	}
 
 	if (OpenDevice(A314_NAME, 0, (struct IORequest *)sync_a314_req, 0))
 	{
-		printf("Unable to open a314.device\n");
+		report("Unable to open a314.device");
 		goto cleanup;
 	}
 
@@ -313,7 +402,7 @@ int main(int argc, char **argv)
 		audio_buffers[2] = AllocMem(SAMPLES * 2, MEMF_A314 | MEMF_CHIP | MEMF_CLEAR);
 		if (!audio_buffers[2])
 		{
-			printf("Unable to allocate audio buffers in A314 chip memory\n");
+			report("Unable to allocate audio buffers in A314 chip memory");
 			goto cleanup;
 		}
 		has_a314_chip_memory = TRUE;
@@ -324,7 +413,7 @@ int main(int argc, char **argv)
 		audio_buffers[2] = AllocMem(SAMPLES * 2, MEMF_CHIP | MEMF_CLEAR);
 		if (!audio_buffers[0] || !audio_buffers[2])
 		{
-			printf("Unable to allocate audio buffers in chip memory\n");
+			report("Unable to allocate audio buffers in chip memory");
 			goto cleanup;
 		}
 
@@ -333,7 +422,7 @@ int main(int argc, char **argv)
 		if (a314_buffers[0] == INVALID_A314_ADDRESS ||
 			a314_buffers[1] == INVALID_A314_ADDRESS)
 		{
-			printf("Unable to allocate buffers in A314 memory\n");
+			report("Unable to allocate buffers in A314 memory");
 			goto cleanup;
 		}
 
@@ -351,7 +440,7 @@ int main(int argc, char **argv)
 
 	if (a314_connect(SERVICE_NAME) != A314_CONNECT_OK)
 	{
-		printf("Unable to connect to piaudio service\n");
+		report("Unable to connect to piaudio service");
 		goto cleanup;
 	}
 
@@ -371,7 +460,7 @@ int main(int argc, char **argv)
 
 	if (a314_write(awbuf, 8) != A314_WRITE_OK)
 	{
-		printf("Unable to write buffer pointers\n");
+		report("Unable to write buffer pointers");
 		goto cleanup;
 	}
 
@@ -380,14 +469,16 @@ int main(int argc, char **argv)
 
 	if (use_ahi)
 	{
-		printf("PiAudio started, playing through AHI\n");
+		if (!_WBenchMsg)
+			printf("PiAudio started, playing through AHI\n");
 		submit_ahi_req(back_index);
 	}
 	else
 	{
-		printf("PiAudio started, allocated channels: L%d, R%d\n",
-			(allocated_channels & LEFT_CHAN_MASK) == L0 ? 0 : 1,
-			(allocated_channels & RIGHT_CHAN_MASK) == R0 ? 0 : 1);
+		if (!_WBenchMsg)
+			printf("PiAudio started, allocated channels: L%d, R%d\n",
+				(allocated_channels & LEFT_CHAN_MASK) == L0 ? 0 : 1,
+				(allocated_channels & RIGHT_CHAN_MASK) == R0 ? 0 : 1);
 
 		sync_audio_req->ioa_Request.io_Command = CMD_STOP;
 		DoIO((struct IORequest *)sync_audio_req);
@@ -403,7 +494,8 @@ int main(int argc, char **argv)
 
 	ULONG portsig = 1L << async_mp->mp_SigBit;
 
-	printf("Press ctrl-c to exit...\n");
+	if (!_WBenchMsg)
+		printf("Press ctrl-c to exit...\n");
 
 	while (TRUE)
 	{
@@ -508,6 +600,12 @@ cleanup:
 		DeletePort(async_mp);
 	if (sync_mp)
 		DeletePort(sync_mp);
+	if (marker_port)
+		DeletePort(marker_port);
+	if (IconBase)
+		CloseLibrary(IconBase);
+	if (IntuitionBase)
+		CloseLibrary((struct Library *)IntuitionBase);
 	SetTaskPri(FindTask(NULL), old_priority);
 
 	return 0;
