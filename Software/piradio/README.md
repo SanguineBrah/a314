@@ -19,7 +19,8 @@ On the Amiga:
 
 ## Running
 
-Copy *PiRadio* and *PiRadio.info* to a drawer and double-click the icon.
+Copy *PiRadio* and *PiRadio.info* to SYS:Utilities (`make -f Makefile-amiga`
+puts them in `bin_amiga/Utilities`) and double-click the icon.
 PiAudio has to be running as well; it can also be started from its icon
 (see the [PiAudio README](../piaudio/README.md)). From the shell:
 
