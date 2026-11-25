@@ -17,16 +17,15 @@
  * changes them (see a314prefs.py). The images are chosen from the files in
  * the Pi user's home directory.
  *
- * Only uses Kickstart/Workbench 1.3 functions.
+ * The windows are made by a314gui (gadtools.library on 2.04 and later).
+ * Only needs Kickstart/Workbench 1.3.
  */
 
 #include <exec/types.h>
 #include <exec/memory.h>
 #include <exec/ports.h>
 #include <devices/timer.h>
-#include <graphics/text.h>
 #include <intuition/intuition.h>
-#include <intuition/screens.h>
 #include <workbench/startup.h>
 #include <libraries/dos.h>
 
@@ -41,55 +40,40 @@
 #include <time.h>
 
 #include "../a314device/a314.h"
+#include "a314gui.h"
 
 #define SERVICE_NAME	"a314prefs"
 
 #define DRIVES		4
 #define SCSI_UNITS	4
+#define ROWS		(DRIVES + SCSI_UNITS)
 #define PATH_LEN	250		/* relative to the Pi user's home */
 #define MAX_FILES	200
 #define NAME_LEN	120		/* the longest the Pi sends */
 
-/* Main window layout, inside the borders */
-#define INNER_W		600
-#define INNER_H		182
-#define ROW_H		14
-#define DRIVE_Y		16
-#define SCSI_Y		88
-#define LABEL_X		8
-#define NAME_X		64
-#define NAME_W		288
-#define CHANGE_X	360
-#define CHANGE_W	80
-#define EJECT_X		444
-#define EJECT_W		64
-#define CHECK_X		516
-#define BUTTON_H	12
-#define MSG_Y		150
-#define BOTTOM_Y	166
-#define BOTTOM_W	96
+/* Gadgets and menu items of the main window: + row (drives 0-3, SCSI 4-7) */
+#define ID_IMAGE	100
+#define ID_CHANGE	10
+#define ID_EJECT	20
+#define ID_CHECK	30
+#define ID_HEAD1	40
+#define ID_HEAD2	41
+#define ID_HEAD3	42
+#define ID_HEAD4	43
+#define ID_MSG		44
+#define ID_SAVE		45
+#define ID_USE		46
+#define ID_CANCEL	47
+#define ID_QUIT		50
+#define ID_RESTORE	51
 
-/* File browser layout */
-#define FB_W		440
-#define FB_H		170
-#define FB_ROWS		10
-#define FB_LIST_X	8
-#define FB_LIST_Y	22
-#define FB_LIST_W	400
-#define FB_ROW_H	10
-
-/* Gadget ids */
-#define GID_CHANGE	10		/* + row: drives 0-3, SCSI 4-7 */
-#define GID_EJECT	20
-#define GID_CHECK	30
-#define GID_SAVE	40
-#define GID_USE		41
-#define GID_CANCEL	42
-#define GID_FB_SCROLL	50
-#define GID_FB_PARENT	51
-#define GID_FB_WRITE	52
-#define GID_FB_OK	53
-#define GID_FB_CANCEL	54
+/* ... of the file browser */
+#define ID_FB_DIR	1
+#define ID_FB_LIST	2
+#define ID_FB_WRITE	3
+#define ID_FB_PARENT	4
+#define ID_FB_OK	5
+#define ID_FB_CANCEL	6
 
 struct Image_
 {
@@ -110,11 +94,7 @@ struct GfxBase *GfxBase = NULL;
 /* Set by the startup code when started from Workbench */
 extern struct WBStartup *_WBenchMsg;
 
-static struct TextAttr topaz8 = { (STRPTR)"topaz.font", 8, FS_NORMAL, FPF_ROMFONT };
-static struct TextFont *font = NULL;
-static struct Window *win = NULL;
-static struct RastPort *rp;
-static int ox, oy;
+static struct Gui *gui = NULL;
 
 /* The connection to the Pi */
 static struct MsgPort *mp = NULL;
@@ -140,27 +120,62 @@ static int nfiles = 0;
 
 static BOOL quit = FALSE;
 
+#define ROW(name, kind, r, y) \
+	{ GUI_TEXT, ID_IMAGE + (r), 7, (y), 33, 0, name, 0 }, \
+	{ GUI_BUTTON, ID_CHANGE + (r), 41, (y), 10, 0, "Change...", 0 }, \
+	{ GUI_BUTTON, ID_EJECT + (r), 52, (y), 8, 0, kind, 0 }, \
+	{ GUI_CHECKBOX, ID_CHECK + (r), 62, (y), 4, 0, NULL, 0 }
+
+static const struct GuiItem items[] =
+{
+	{ GUI_LABEL, ID_HEAD1, 0, 0, 50, 0, NULL, 0 },
+	{ GUI_LABEL, ID_HEAD2, 59, 0, 9, 0, NULL, 0 },
+	ROW("PD0:", "Eject", 0, 1), ROW("PD1:", "Eject", 1, 2),
+	ROW("PD2:", "Eject", 2, 3), ROW("PD3:", "Eject", 3, 4),
+	{ GUI_LABEL, ID_HEAD3, 0, 5, 50, 0, NULL, 0 },
+	{ GUI_LABEL, ID_HEAD4, 59, 5, 9, 0, NULL, 0 },
+	ROW("Unit 0", "Remove", 4, 6), ROW("Unit 1", "Remove", 5, 7),
+	ROW("Unit 2", "Remove", 6, 8), ROW("Unit 3", "Remove", 7, 9),
+	{ GUI_TEXT, ID_MSG, 0, 10, 68, 0, NULL, 0 },
+	{ GUI_BUTTON, ID_SAVE, 0, 12, 14, 0, "_Save", 0 },
+	{ GUI_BUTTON, ID_USE, 27, 12, 14, 0, "_Use", 0 },
+	{ GUI_BUTTON, ID_CANCEL, 54, 12, 14, 0, "_Cancel", 0 },
+};
+
+static const struct GuiMenu menus[] =
+{
+	{ GUI_MENU_TITLE, 0, 0, "Project" },
+	{ GUI_MENU_ITEM, 'Q', ID_QUIT, "Quit" },
+	{ GUI_MENU_TITLE, 0, 0, "Edit" },
+	{ GUI_MENU_ITEM, 'R', ID_RESTORE, "Restore" },
+	{ GUI_MENU_END, 0, 0, NULL }
+};
+
+/* The file browser, with and without the Writable box */
+static const struct GuiItem fb_items[] =
+{
+	{ GUI_TEXT, ID_FB_DIR, 4, 0, 42, 0, "In", 0 },
+	{ GUI_LIST, ID_FB_LIST, 0, 1, 46, 8, NULL, 0 },
+	{ GUI_CHECKBOX, ID_FB_WRITE, 0, 9, 4, 0, "_Writable (otherwise read only)", 0 },
+	{ GUI_BUTTON, ID_FB_PARENT, 0, 11, 12, 0, "_Parent", 0 },
+	{ GUI_BUTTON, ID_FB_OK, 17, 11, 12, 0, "_OK", 0 },
+	{ GUI_BUTTON, ID_FB_CANCEL, 34, 11, 12, 0, "_Cancel", 0 },
+};
+
 /* Shows a message in the shell, or in a requester when started from
-   Workbench (where there is no shell). */
+   Workbench (where there is no shell) */
 static void report(const char *text)
 {
-	struct IntuiText body = { 0, 1, JAM2, 16, 8, NULL, (UBYTE *)text, NULL };
-	struct IntuiText ok = { 0, 1, JAM2, 6, 3, NULL, (UBYTE *)"OK", NULL };
-
 	if (!_WBenchMsg || !IntuitionBase)
 		printf("%s\n", text);
 	else
-		AutoRequest(win, &body, NULL, &ok, 0, 0, 8 * strlen(text) + 48, 54);
+		gui_message(gui, text);
 }
 
-static BOOL confirm(const char *line1, const char *line2)
+static void set_msg(const char *s)
 {
-	struct IntuiText t2 = { 0, 1, JAM2, 16, 16, &topaz8, (UBYTE *)line2, NULL };
-	struct IntuiText t1 = { 0, 1, JAM2, 16, 6, &topaz8, (UBYTE *)line1, &t2 };
-	struct IntuiText yes = { 0, 1, JAM2, 6, 3, &topaz8, (UBYTE *)"Yes", NULL };
-	struct IntuiText no = { 0, 1, JAM2, 6, 3, &topaz8, (UBYTE *)"No", NULL };
-	int w = 8 * (strlen(line1) > strlen(line2) ? strlen(line1) : strlen(line2)) + 48;
-	return AutoRequest(win, &t1, &yes, &no, 0, 0, w < 200 ? 200 : w, 60);
+	if (gui)
+		gui_set_text(gui, ID_MSG, s);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -333,7 +348,6 @@ static BOOL next_line(void)
 /* ---------------------------------------------------------------------- */
 /* Talking to the a314prefs service                                       */
 
-static void set_msg(const char *s);
 
 /* Sends a command whose answer is OK or ERR; shows it; TRUE for OK */
 static BOOL simple_cmd(const char *text)
@@ -470,32 +484,7 @@ static BOOL list_files(const char *dir)
 }
 
 /* ---------------------------------------------------------------------- */
-/* Drawing                                                                */
-
-static void print_at(struct RastPort *r, int x, int y, const char *s, int maxlen)
-{
-	int n = strlen(s);
-	if (n > maxlen)
-		n = maxlen;
-	Move(r, x, y + font->tf_Baseline);
-	Text(r, (STRPTR)s, n);
-}
-
-static void clear(struct RastPort *r, int x, int y, int w, int h)
-{
-	SetAPen(r, 0);
-	RectFill(r, x, y, x + w - 1, y + h - 1);
-}
-
-static void draw_box(struct RastPort *r, int x, int y, int w, int h)
-{
-	SetAPen(r, 1);
-	Move(r, x, y);
-	Draw(r, x + w - 1, y);
-	Draw(r, x + w - 1, y + h - 1);
-	Draw(r, x, y + h - 1);
-	Draw(r, x, y);
-}
+/* The main window                                                        */
 
 /* The end of a path, if it doesn't fit */
 static void fit_path(const char *path, char *out, int chars)
@@ -510,195 +499,57 @@ static void fit_path(const char *path, char *out, int chars)
 	}
 }
 
-static void set_msg(const char *s)
-{
-	clear(rp, ox + 8, oy + MSG_Y, INNER_W - 16, 8);
-	SetAPen(rp, 1);
-	print_at(rp, ox + 8, oy + MSG_Y, s, (INNER_W - 16) / 8);
-}
-
-static void draw_check(int row)
-{
-	BOOL on = row < DRIVES ? at_start[row] : scsi[row - DRIVES].rw;
-	int y = oy + (row < DRIVES ? DRIVE_Y + row * ROW_H : SCSI_Y + (row - DRIVES) * ROW_H) + 2;
-	clear(rp, ox + CHECK_X + 1, y + 1, 14, 8);
-	SetAPen(rp, 1);
-	if (on)
-		print_at(rp, ox + CHECK_X + 4, y + 1, "X", 1);
-}
-
-static void draw_row(int row)
+static void show_row(int row)
 {
 	struct Image_ *img = row < DRIVES ? &drives[row] : &scsi[row - DRIVES];
-	int y = oy + (row < DRIVES ? DRIVE_Y + row * ROW_H : SCSI_Y + (row - DRIVES) * ROW_H) + 2;
-	char text[NAME_W / 8 + 1];
+	char text[80], name[64];
 
-	clear(rp, ox + NAME_X + 1, y + 1, NAME_W - 2, 8);
-	SetAPen(rp, 1);
 	if (row < DRIVES && !drives_known)
-		strcpy(text, "(not in use - mount PD0: first)");
+		strcpy(text, "(not in use: mount PD0: first)");
 	else if (!img->path[0])
 		strcpy(text, row < DRIVES ? "(empty)" : "(none)");
 	else
 	{
-		char name[NAME_W / 8 + 1];
-		int room = NAME_W / 8 - 2 - (row < DRIVES && img->rw ? 11 : 0);
-		fit_path(img->path, name, room);
+		fit_path(img->path, name, row < DRIVES && img->rw ? 26 : 38);
 		sprintf(text, "%s%s", name, row < DRIVES && img->rw ? " (writable)" : "");
 	}
-	print_at(rp, ox + NAME_X + 4, y + 1, text, NAME_W / 8 - 1);
-	draw_check(row);
+	gui_set_text(gui, ID_IMAGE + row, text);
+	gui_set_check(gui, ID_CHECK + row, row < DRIVES ? at_start[row] : scsi[row - DRIVES].rw);
 }
 
-/* ---------------------------------------------------------------------- */
-/* Gadgets                                                                */
-
-static SHORT change_xy[] = { 0,0, CHANGE_W-1,0, CHANGE_W-1,BUTTON_H-1, 0,BUTTON_H-1, 0,0 };
-static struct Border change_border = { 0, 0, 1, 0, JAM1, 5, change_xy, NULL };
-static SHORT eject_xy[] = { 0,0, EJECT_W-1,0, EJECT_W-1,BUTTON_H-1, 0,BUTTON_H-1, 0,0 };
-static struct Border eject_border = { 0, 0, 1, 0, JAM1, 5, eject_xy, NULL };
-static SHORT check_xy[] = { 0,0, 15,0, 15,BUTTON_H-1, 0,BUTTON_H-1, 0,0 };
-static struct Border check_border = { 0, 0, 1, 0, JAM1, 5, check_xy, NULL };
-static SHORT bottom_xy[] = { 0,0, BOTTOM_W-1,0, BOTTOM_W-1,13, 0,13, 0,0 };
-static struct Border bottom_border = { 0, 0, 1, 0, JAM1, 5, bottom_xy, NULL };
-
-#define ROWS (DRIVES + SCSI_UNITS)
-static struct Gadget change_g[ROWS], eject_g[ROWS], check_g[ROWS], bottom_g[3];
-static struct IntuiText change_t[ROWS], eject_t[ROWS], bottom_t[3];
-static const char *bottom_labels[3] = { "Save", "Use", "Cancel" };
-
-static void make_button(struct Gadget *g, struct IntuiText *t, const char *label, int x, int y,
-	int w, int h, struct Border *border, int id)
+static void show_all(void)
 {
-	memset(g, 0, sizeof(*g));
-	g->LeftEdge = x;
-	g->TopEdge = y;
-	g->Width = w;
-	g->Height = h;
-	g->Flags = GFLG_GADGHCOMP;
-	g->Activation = GACT_RELVERIFY;
-	g->GadgetType = GTYP_BOOLGADGET;
-	g->GadgetRender = border;
-	g->GadgetID = id;
-	if (t)
-	{
-		memset(t, 0, sizeof(*t));
-		t->FrontPen = 1;
-		t->DrawMode = JAM1;
-		t->LeftEdge = (w - 8 * (int)strlen(label)) / 2;
-		t->TopEdge = (h - 8) / 2;
-		t->ITextFont = &topaz8;
-		t->IText = (UBYTE *)label;
-		g->GadgetText = t;
-	}
-}
-
-static void init_gadgets(void)
-{
-	int i;
-	for (i = 0; i < ROWS; i++)
-	{
-		int y = oy + (i < DRIVES ? DRIVE_Y + i * ROW_H : SCSI_Y + (i - DRIVES) * ROW_H);
-		make_button(&change_g[i], &change_t[i], "Change", ox + CHANGE_X, y, CHANGE_W, BUTTON_H,
-			&change_border, GID_CHANGE + i);
-		make_button(&eject_g[i], &eject_t[i], i < DRIVES ? "Eject" : "Remove", ox + EJECT_X, y,
-			EJECT_W, BUTTON_H, &eject_border, GID_EJECT + i);
-		make_button(&check_g[i], NULL, "", ox + CHECK_X, y, 16, BUTTON_H, &check_border, GID_CHECK + i);
-	}
-	for (i = 0; i < 3; i++)
-		make_button(&bottom_g[i], &bottom_t[i], bottom_labels[i],
-			ox + 8 + i * (INNER_W - 16 - BOTTOM_W) / 2, oy + BOTTOM_Y, BOTTOM_W, 14,
-			&bottom_border, GID_SAVE + i);
-}
-
-static void draw_all(void)
-{
-	int i;
-	SetAPen(rp, 1);
-	print_at(rp, ox + 8, oy + 4, "Disk drives (a314disk.device)", 40);
-	print_at(rp, ox + CHECK_X - 12, oy + 4, "At start", 8);
-	print_at(rp, ox + 8, oy + SCSI_Y - 12, "Hard disks (a314scsi.device), from the next start", 58);
-	print_at(rp, ox + CHECK_X - 12, oy + SCSI_Y - 12, "Writable", 8);
-	for (i = 0; i < ROWS; i++)
-	{
-		char label[8];
-		int y = oy + (i < DRIVES ? DRIVE_Y + i * ROW_H : SCSI_Y + (i - DRIVES) * ROW_H);
-		if (i < DRIVES)
-			sprintf(label, "PD%d:", i);
-		else
-			sprintf(label, "Unit %d", i - DRIVES);
-		SetAPen(rp, 1);
-		print_at(rp, ox + LABEL_X, y + 3, label, 6);
-		draw_box(rp, ox + NAME_X, y, NAME_W, BUTTON_H);
-		draw_row(i);
-	}
+	int r;
+	for (r = 0; r < ROWS; r++)
+		show_row(r);
 }
 
 /* ---------------------------------------------------------------------- */
 /* The file browser                                                       */
 
-static struct Window *fbw = NULL;
-static struct RastPort *frp;
-static int fox, foy;
 static char fb_dir[PATH_LEN + 1];
-static int fb_top, fb_selected;
-static BOOL fb_writable;
-static struct Gadget fb_scroller, fb_buttons[4];
-static struct IntuiText fb_texts[4];
-static struct PropInfo fb_scroll_info;
-static struct Image fb_knob;
-static SHORT fb_xy[] = { 0,0, 79,0, 79,13, 0,13, 0,0 };
-static struct Border fb_border = { 0, 0, 1, 0, JAM1, 5, fb_xy, NULL };
+static char fb_text[MAX_FILES][NAME_LEN + 16];
+static const char *fb_lines[MAX_FILES];
 
-static void fb_draw_list(void)
+static void fb_show(struct Gui *fb)
 {
+	char dir[48];
 	int i;
-	char text[NAME_LEN + 16], dir[FB_LIST_W / 8 + 1];
 
-	clear(frp, fox + 8, foy + 6, FB_W - 16, 8);
-	SetAPen(frp, 1);
-	fit_path(fb_dir[0] ? fb_dir : "(home)", dir, FB_LIST_W / 8 - 4);
-	sprintf(text, "In: %s", dir);
-	print_at(frp, fox + 8, foy + 6, text, FB_LIST_W / 8);
-
-	for (i = 0; i < FB_ROWS; i++)
+	fit_path(fb_dir[0] ? fb_dir : "(your home directory on the Pi)", dir, 40);
+	gui_set_text(fb, ID_FB_DIR, dir);
+	for (i = 0; i < nfiles; i++)
 	{
-		int n = fb_top + i;
-		int y = foy + FB_LIST_Y + i * FB_ROW_H;
-		clear(frp, fox + FB_LIST_X + 1, y, FB_LIST_W - 2, FB_ROW_H);
-		if (n >= nfiles)
-			continue;
-		if (n == fb_selected)
-		{
-			SetAPen(frp, 3);
-			RectFill(frp, fox + FB_LIST_X + 1, y, fox + FB_LIST_X + FB_LIST_W - 2, y + FB_ROW_H - 1);
-		}
-		SetAPen(frp, n == fb_selected ? 2 : 1);
-		if (files[n].dir)
-			sprintf(text, "%.60s/", files[n].name);
+		if (files[i].dir)
+			sprintf(fb_text[i], "%.100s/", files[i].name);
 		else
-			sprintf(text, "%-40.40s %5luK", files[n].name, files[n].size >> 10);
-		print_at(frp, fox + FB_LIST_X + 4, y + 1, text, FB_LIST_W / 8 - 1);
+			sprintf(fb_text[i], "%.100s  (%luK)", files[i].name, files[i].size >> 10);
+		fb_lines[i] = fb_text[i];
 	}
-	draw_box(frp, fox + FB_LIST_X, foy + FB_LIST_Y - 1, FB_LIST_W, FB_ROWS * FB_ROW_H + 2);
+	gui_set_list(fb, ID_FB_LIST, fb_lines, nfiles, -1);
 }
 
-static void fb_update_scroller(void)
-{
-	UWORD body = nfiles > FB_ROWS ? (UWORD)((ULONG)MAXBODY * FB_ROWS / nfiles) : MAXBODY;
-	UWORD pot = nfiles > FB_ROWS ? (UWORD)((ULONG)MAXPOT * fb_top / (nfiles - FB_ROWS)) : 0;
-	ModifyProp(&fb_scroller, fbw, NULL, AUTOKNOB | FREEVERT | PROPNEWLOOK, 0, pot, 0, body);
-}
-
-static void fb_draw_check(void)
-{
-	clear(frp, fox + 9, foy + FB_H - 33, 14, 8);
-	SetAPen(frp, 1);
-	if (fb_writable)
-		print_at(frp, fox + 12, foy + FB_H - 33, "X", 1);
-}
-
-static BOOL fb_enter(const char *dir)
+static void fb_enter(struct Gui *fb, const char *dir)
 {
 	char old[PATH_LEN + 1];
 	strcpy(old, fb_dir);
@@ -709,82 +560,32 @@ static BOOL fb_enter(const char *dir)
 		strcpy(fb_dir, old);
 		list_files(fb_dir);
 	}
-	fb_top = 0;
-	fb_selected = -1;
-	fb_draw_list();
-	fb_update_scroller();
-	return TRUE;
+	fb_show(fb);
 }
 
 /* A file browser for disk images on the Pi; TRUE with the chosen file in
    out. writable_choice: show the Writable box (for drives). */
 static BOOL choose_file(char *out, BOOL *writable, BOOL writable_choice)
 {
-	struct NewWindow nw;
-	struct IntuiMessage *im;
+	struct Gui *fb;
+	struct GuiEvent ev;
 	BOOL done = FALSE, chosen = FALSE;
-	int i;
-	static const char *labels[4] = { "Parent", "", "OK", "Cancel" };
+	int selected = -1;
 
-	memset(&nw, 0, sizeof(nw));
-	nw.LeftEdge = win->LeftEdge + 40;
-	nw.TopEdge = win->TopEdge + 6;
-	nw.Width = FB_W + win->BorderLeft + win->BorderRight;
-	nw.Height = FB_H + win->BorderTop + win->BorderBottom;
-	nw.DetailPen = 0;
-	nw.BlockPen = 1;
-	nw.IDCMPFlags = IDCMP_GADGETUP | IDCMP_MOUSEBUTTONS | IDCMP_MOUSEMOVE | IDCMP_CLOSEWINDOW;
-	nw.Flags = WFLG_DRAGBAR | WFLG_DEPTHGADGET | WFLG_CLOSEGADGET | WFLG_SMART_REFRESH |
-		WFLG_NOCAREREFRESH | WFLG_ACTIVATE | WFLG_RMBTRAP;
-	nw.Title = (UBYTE *)"Choose a disk image on the Pi";
-	nw.Type = WBENCHSCREEN;
-	fbw = OpenWindow(&nw);
-	if (!fbw)
-		return FALSE;
-	frp = fbw->RPort;
-	SetFont(frp, font);
-	SetDrMd(frp, JAM1);
-	fox = fbw->BorderLeft;
-	foy = fbw->BorderTop;
-
-	memset(&fb_scroller, 0, sizeof(fb_scroller));
-	fb_scroller.LeftEdge = fox + FB_LIST_X + FB_LIST_W + 4;
-	fb_scroller.TopEdge = foy + FB_LIST_Y;
-	fb_scroller.Width = 16;
-	fb_scroller.Height = FB_ROWS * FB_ROW_H;
-	fb_scroller.Flags = GFLG_GADGHCOMP;
-	fb_scroller.Activation = GACT_RELVERIFY | GACT_FOLLOWMOUSE;
-	fb_scroller.GadgetType = GTYP_PROPGADGET;
-	fb_scroller.GadgetRender = &fb_knob;
-	fb_scroller.SpecialInfo = &fb_scroll_info;
-	fb_scroller.GadgetID = GID_FB_SCROLL;
-	fb_scroll_info.Flags = AUTOKNOB | FREEVERT | PROPNEWLOOK;
-	fb_scroll_info.VertBody = MAXBODY;
-	AddGadget(fbw, &fb_scroller, -1);
-
-	for (i = 0; i < 4; i++)
-	{
-		if (i == 1)
-		{
-			if (!writable_choice)
-				continue;
-			make_button(&fb_buttons[i], NULL, "", fox + 8, foy + FB_H - 35, 16, BUTTON_H,
-				&check_border, GID_FB_WRITE);
-		}
-		else
-			make_button(&fb_buttons[i], &fb_texts[i], labels[i],
-				fox + (i == 0 ? 8 : i == 2 ? FB_W - 176 : FB_W - 88), foy + FB_H - 18, 80, 14,
-				&fb_border, i == 0 ? GID_FB_PARENT : i == 2 ? GID_FB_OK : GID_FB_CANCEL);
-		AddGadget(fbw, &fb_buttons[i], -1);
-	}
-	RefreshGadgets(fbw->FirstGadget, fbw, NULL);
 	if (writable_choice)
+		fb = gui_open("Choose a Disk Image on the Pi", fb_items, 6, NULL);
+	else
 	{
-		SetAPen(frp, 1);
-		print_at(frp, fox + 30, foy + FB_H - 33, "Writable (otherwise read only)", 32);
-		fb_writable = *writable;
-		fb_draw_check();
+		/* Without the Writable box */
+		static struct GuiItem items2[5];
+		memcpy(items2, fb_items, 2 * sizeof(struct GuiItem));
+		memcpy(items2 + 2, fb_items + 3, 3 * sizeof(struct GuiItem));
+		fb = gui_open("Choose a Hard Disk Image on the Pi", items2, 5, NULL);
 	}
+	if (!fb)
+		return FALSE;
+	if (writable_choice)
+		gui_set_check(fb, ID_FB_WRITE, *writable);
 
 	/* Start in the directory of the current file, if any */
 	{
@@ -796,108 +597,88 @@ static BOOL choose_file(char *out, BOOL *writable, BOOL writable_choice)
 		else
 			dir[0] = '\0';
 		fb_dir[0] = '\0';
-		fb_enter(dir);
+		fb_enter(fb, dir);
 	}
 
 	while (!done)
 	{
-		Wait(1L << fbw->UserPort->mp_SigBit);
-		while ((im = (struct IntuiMessage *)GetMsg(fbw->UserPort)) != NULL)
+		Wait(gui_signal(fb));
+		while (!done && gui_event(fb, &ev))
 		{
-			ULONG cls = im->Class;
-			UWORD code = im->Code;
-			int mx = im->MouseX, my = im->MouseY;
-			struct Gadget *g = (struct Gadget *)im->IAddress;
-			ReplyMsg((struct Message *)im);
-
-			if (cls == IDCMP_CLOSEWINDOW)
+			if (ev.type == GUI_EV_CLOSE)
+			{
 				done = TRUE;
-			else if (cls == IDCMP_MOUSEMOVE || (cls == IDCMP_GADGETUP && g->GadgetID == GID_FB_SCROLL))
-			{
-				int top = nfiles > FB_ROWS ?
-					(int)(((ULONG)fb_scroll_info.VertPot * (nfiles - FB_ROWS) + MAXPOT / 2) / MAXPOT) : 0;
-				if (top != fb_top)
-				{
-					fb_top = top;
-					fb_draw_list();
-				}
+				break;
 			}
-			else if (cls == IDCMP_MOUSEBUTTONS && code == SELECTDOWN &&
-				mx >= fox + FB_LIST_X && mx < fox + FB_LIST_X + FB_LIST_W &&
-				my >= foy + FB_LIST_Y && my < foy + FB_LIST_Y + FB_ROWS * FB_ROW_H)
+			switch (ev.id)
 			{
-				int n = fb_top + (my - foy - FB_LIST_Y) / FB_ROW_H;
-				if (n < nfiles)
+			case ID_FB_LIST:
+			{
+				int n = (int)ev.value;
+				if (n < 0 || n >= nfiles)
+					break;
+				if (files[n].dir)
 				{
-					if (files[n].dir)
-					{
-						char dir[PATH_LEN + 1];
-						if (!fb_dir[0])
-							strcpy(dir, files[n].name);
-						else if (strlen(fb_dir) + strlen(files[n].name) + 1 < PATH_LEN)
-							sprintf(dir, "%s/%s", fb_dir, files[n].name);
-						else
-						{
-							set_msg("The path is too long");
-							continue;
-						}
-						fb_enter(dir);
-					}
+					char dir[PATH_LEN + 1];
+					if (!fb_dir[0])
+						strcpy(dir, files[n].name);
+					else if (strlen(fb_dir) + strlen(files[n].name) + 1 < PATH_LEN)
+						sprintf(dir, "%s/%s", fb_dir, files[n].name);
 					else
 					{
-						fb_selected = n;
-						fb_draw_list();
+						set_msg("The path is too long");
+						break;
 					}
+					selected = -1;
+					fb_enter(fb, dir);
 				}
+				else if (n == selected)
+					goto ok;	/* chosen twice: as OK */
+				else
+					selected = n;
+				break;
 			}
-			else if (cls == IDCMP_GADGETUP)
+			case ID_FB_PARENT:
 			{
-				switch (g->GadgetID)
+				char dir[PATH_LEN + 1], *slash;
+				strcpy(dir, fb_dir);
+				slash = strrchr(dir, '/');
+				if (slash)
+					*slash = '\0';
+				else
+					dir[0] = '\0';
+				selected = -1;
+				fb_enter(fb, dir);
+				break;
+			}
+			case ID_FB_OK:
+			ok:
+				if (selected >= 0 && selected < nfiles)
 				{
-				case GID_FB_PARENT:
-				{
-					char dir[PATH_LEN + 1], *slash;
-					strcpy(dir, fb_dir);
-					slash = strrchr(dir, '/');
-					if (slash)
-						*slash = '\0';
+					if (!fb_dir[0])
+						strcpy(out, files[selected].name);
+					else if (strlen(fb_dir) + strlen(files[selected].name) + 1 <= PATH_LEN)
+						sprintf(out, "%s/%s", fb_dir, files[selected].name);
 					else
-						dir[0] = '\0';
-					fb_enter(dir);
-					break;
-				}
-				case GID_FB_WRITE:
-					fb_writable = !fb_writable;
-					fb_draw_check();
-					break;
-				case GID_FB_OK:
-					if (fb_selected >= 0 && fb_selected < nfiles)
 					{
-						if (!fb_dir[0])
-							strcpy(out, files[fb_selected].name);
-						else if (strlen(fb_dir) + strlen(files[fb_selected].name) + 1 <= PATH_LEN)
-							sprintf(out, "%s/%s", fb_dir, files[fb_selected].name);
-						else
-						{
-							set_msg("The path is too long");
-							break;
-						}
-						*writable = fb_writable;
-						chosen = done = TRUE;
+						set_msg("The path is too long");
+						break;
 					}
-					break;
-				case GID_FB_CANCEL:
-					done = TRUE;
-					break;
+					if (writable_choice)
+						*writable = gui_get_check(fb, ID_FB_WRITE);
+					chosen = done = TRUE;
 				}
+				break;
+			case ID_FB_CANCEL:
+				done = TRUE;
+				break;
 			}
 		}
 	}
-	CloseWindow(fbw);
-	fbw = NULL;
+	gui_close(fb);
 	/* Clicks on the main window while the browser was open are dropped */
-	while ((im = (struct IntuiMessage *)GetMsg(win->UserPort)) != NULL)
-		ReplyMsg((struct Message *)im);
+	while (gui_event(gui, &ev))
+		;
 	return chosen;
 }
 
@@ -963,7 +744,7 @@ static void change_pressed(int row)
 		scsi_changed[row - DRIVES] = TRUE;
 		set_msg("Save to use it from the next start");
 	}
-	draw_row(row);
+	show_row(row);
 }
 
 static void eject_pressed(int row)
@@ -987,29 +768,31 @@ static void eject_pressed(int row)
 		scsi_changed[row - DRIVES] = TRUE;
 		set_msg("Save to take it away from the next start");
 	}
-	draw_row(row);
+	show_row(row);
 }
 
-static void check_pressed(int row)
+/* An "At start" or "Writable" box was clicked; on is its new state */
+static void check_pressed(int row, BOOL on)
 {
 	if (row < DRIVES)
 	{
 		if (!drives[row].path[0])
 		{
 			set_msg("Put an image in the drive first");
+			gui_set_check(gui, ID_CHECK + row, FALSE);
 			return;
 		}
-		at_start[row] = !at_start[row];
+		at_start[row] = on;
 		at_start_changed[row] = TRUE;
 		set_msg(at_start[row] ? "Save to have this disk in the drive at start" :
 			"Save to start without a disk in this drive");
 	}
 	else
 	{
-		scsi[row - DRIVES].rw = !scsi[row - DRIVES].rw;
+		scsi[row - DRIVES].rw = on;
 		scsi_changed[row - DRIVES] = TRUE;
+		set_msg("Save to use it from the next start");
 	}
-	draw_check(row);
 }
 
 /* Save: the start-up images and SCSI units that were changed */
@@ -1027,8 +810,7 @@ static BOOL save_settings(void)
 		to_hex(at_start[i] ? drives[i].path : "", cmd + n, sizeof(cmd) - n);
 		ok = simple_cmd(cmd) && ok;
 	}
-	if (scsi_changed[0] && !confirm("Hard disk unit 0 is usually the disk the",
-		"Amiga starts from. Change it?"))
+	if (scsi_changed[0] && !gui_ask(gui, "Hard disk unit 0 is usually the disk the Amiga\nstarts from. Change it?", "Change|Cancel"))
 		return FALSE;
 	for (i = 0; i < SCSI_UNITS; i++)
 	{
@@ -1070,97 +852,49 @@ static BOOL unsaved(void)
 	return FALSE;
 }
 
-static void handle_window(void)
+static void handle_event(struct GuiEvent *ev)
 {
-	struct IntuiMessage *im;
+	int id = ev->id;
 
-	while ((im = (struct IntuiMessage *)GetMsg(win->UserPort)) != NULL)
+	if (ev->type == GUI_EV_CLOSE)
 	{
-		ULONG cls = im->Class;
-		struct Gadget *g = (struct Gadget *)im->IAddress;
-		ReplyMsg((struct Message *)im);
-
-		if (cls == IDCMP_CLOSEWINDOW)
-		{
-			restore_drives();
+		restore_drives();
+		quit = TRUE;
+	}
+	else if (id >= ID_IMAGE)
+		;
+	else if (id >= ID_CHANGE && id < ID_CHANGE + ROWS)
+		change_pressed(id - ID_CHANGE);
+	else if (id >= ID_EJECT && id < ID_EJECT + ROWS)
+		eject_pressed(id - ID_EJECT);
+	else if (id >= ID_CHECK && id < ID_CHECK + ROWS)
+		check_pressed(id - ID_CHECK, ev->value != 0);
+	else if (id == ID_SAVE)
+	{
+		if (save_settings())
 			quit = TRUE;
-		}
-		else if (cls == IDCMP_GADGETUP)
-		{
-			int id = g->GadgetID;
-			if (id >= GID_CHANGE && id < GID_CHANGE + ROWS)
-				change_pressed(id - GID_CHANGE);
-			else if (id >= GID_EJECT && id < GID_EJECT + ROWS)
-				eject_pressed(id - GID_EJECT);
-			else if (id >= GID_CHECK && id < GID_CHECK + ROWS)
-				check_pressed(id - GID_CHECK);
-			else if (id == GID_SAVE)
-			{
-				if (save_settings())
-					quit = TRUE;
-			}
-			else if (id == GID_USE)
-			{
-				if (!unsaved() || confirm("Start-up and hard disk changes are only kept",
-					"with Save. Close without saving them?"))
-					quit = TRUE;
-			}
-			else if (id == GID_CANCEL)
-			{
-				restore_drives();
-				quit = TRUE;
-			}
-		}
 	}
-}
-
-static BOOL open_window(void)
-{
-	struct Screen wb;
-	struct NewWindow nw;
-	int i;
-
-	if (!GetScreenData((APTR)&wb, sizeof(wb), WBENCHSCREEN, NULL))
-		return FALSE;
-
-	memset(&nw, 0, sizeof(nw));
-	nw.Width = INNER_W + wb.WBorLeft + wb.WBorRight;
-	nw.Height = INNER_H + wb.WBorTop + wb.Font->ta_YSize + 1 + wb.WBorBottom;
-	nw.LeftEdge = (wb.Width - nw.Width) / 2;
-	nw.TopEdge = wb.BarHeight + 1;
-	if (nw.LeftEdge < 0)
-		nw.LeftEdge = 0;
-	if (nw.TopEdge + nw.Height > wb.Height)
-		nw.TopEdge = 0;
-	nw.DetailPen = 0;
-	nw.BlockPen = 1;
-	nw.IDCMPFlags = IDCMP_CLOSEWINDOW | IDCMP_GADGETUP;
-	nw.Flags = WFLG_DRAGBAR | WFLG_DEPTHGADGET | WFLG_CLOSEGADGET |
-		WFLG_SMART_REFRESH | WFLG_NOCAREREFRESH | WFLG_ACTIVATE | WFLG_RMBTRAP;
-	nw.Title = (UBYTE *)"A314 Disks";
-	nw.Type = WBENCHSCREEN;
-
-	win = OpenWindow(&nw);
-	if (!win)
-		return FALSE;
-	rp = win->RPort;
-	SetFont(rp, font);
-	SetDrMd(rp, JAM1);
-	ox = win->BorderLeft;
-	oy = win->BorderTop;
-
-	init_gadgets();
-	for (i = 0; i < ROWS; i++)
+	else if (id == ID_USE)
 	{
-		AddGadget(win, &change_g[i], -1);
-		AddGadget(win, &eject_g[i], -1);
-		AddGadget(win, &check_g[i], -1);
+		if (!unsaved() || gui_ask(gui, "Start-up and hard disk changes are only kept\nwith Save. Close without saving them?",
+			"Close|Cancel"))
+			quit = TRUE;
 	}
-	for (i = 0; i < 3; i++)
-		AddGadget(win, &bottom_g[i], -1);
-	RefreshGadgets(win->FirstGadget, win, NULL);
-	draw_all();
-	return TRUE;
+	else if (id == ID_CANCEL || id == ID_QUIT)
+	{
+		restore_drives();
+		quit = TRUE;
+	}
+	else if (id == ID_RESTORE)
+	{
+		int i;
+		restore_drives();
+		for (i = 0; i < DRIVES; i++)
+			drives[i] = drives_orig[i];
+		load_state();
+		show_all();
+		set_msg("The drives and settings are as they were");
+	}
 }
 
 int main(void)
@@ -1200,7 +934,7 @@ int main(void)
 	}
 	if (!timer_open || !a314_open)
 	{
-		report("a314.device not found - is the A314 software installed?");
+		report("The A314 software (a314.device) is not installed");
 		rc = 20;
 		goto cleanup;
 	}
@@ -1212,22 +946,37 @@ int main(void)
 		rc = 20;
 		goto cleanup;
 	}
-
-	font = OpenFont(&topaz8);
-	if (!load_state() || !font || !open_window())
+	if (!load_state())
 	{
-		report(font ? "Unable to read the disk settings from the Pi" : "Unable to open the window");
+		report("Unable to read the disk settings from the Pi");
 		rc = 20;
 		goto cleanup;
 	}
 
+	gui = gui_open("A314 Disks Preferences", items, sizeof(items) / sizeof(items[0]), menus);
+	if (!gui)
+	{
+		report("Unable to open the window");
+		rc = 20;
+		goto cleanup;
+	}
+	gui_set_text(gui, ID_HEAD1, "Disk drives (a314disk.device):");
+	gui_set_text(gui, ID_HEAD2, "At start");
+	gui_set_text(gui, ID_HEAD3, "Hard disks (a314scsi.device), from the next start:");
+	gui_set_text(gui, ID_HEAD4, "Writable");
+	show_all();
+
 	while (!quit)
 	{
-		Wait(1L << win->UserPort->mp_SigBit);
-		handle_window();
+		struct GuiEvent ev;
+		Wait(gui_signal(gui));
+		while (!quit && gui_event(gui, &ev))
+			handle_event(&ev);
 	}
 
 cleanup:
+	gui_close(gui);
+	gui = NULL;
 	if (a314_open)
 	{
 		disconnect();
@@ -1235,11 +984,6 @@ cleanup:
 	}
 	if (timer_open)
 		CloseDevice((struct IORequest *)treq);
-	if (win)
-		CloseWindow(win);
-	win = NULL;
-	if (font)
-		CloseFont(font);
 	if (treq)
 		DeleteExtIO((struct IORequest *)treq);
 	if (wmsg)

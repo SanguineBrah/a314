@@ -80,6 +80,6 @@ ${BIN}/C/A314shd: a314device/a314.h a314sh/a314shd.c
 	${VC} a314sh/a314shd.c -lamiga -o ${BIN}/C/A314shd
 
 all: ${BIN}/Prefs/A314/Disks
-${BIN}/Prefs/A314/Disks: a314device/a314.h prefs/disksprefs.c prefs/Disks.info ${BIN}/Prefs/A314.info
-	${VC} prefs/disksprefs.c -lamiga -o ${BIN}/Prefs/A314/Disks
+${BIN}/Prefs/A314/Disks: a314device/a314.h prefs/disksprefs.c prefs/a314gui.c prefs/a314gui.h prefs/Disks.info ${BIN}/Prefs/A314.info
+	${VC} prefs/disksprefs.c prefs/a314gui.c -lamiga -o ${BIN}/Prefs/A314/Disks
 	cp prefs/Disks.info ${BIN}/Prefs/A314/Disks.info
