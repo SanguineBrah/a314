@@ -39,9 +39,9 @@ screen behind the Workbench, and it carries on playing; bring it back with
 the screen's depth gadget or Left-Amiga+M.
 
 PiRadio needs about 210 KB of chip memory for its screen and pictures. To
-have it in a window on the Workbench instead, add the ToolType `WINDOW` to
-its icon (select the icon and choose Information from the Icons menu), or
-start it from the shell with `PiRadio WINDOW`.
+have it in a window on the Workbench instead, switch on the ToolType
+`(WINDOW)` in its icon: select the icon, choose Information from the Icons
+menu, and take away the brackets. From the shell: `PiRadio WINDOW`.
 
 While PiRadio is running, the piradio service has the piaudio pipe open, so
 other programs on the Pi should not play sound to the Amiga at the same
