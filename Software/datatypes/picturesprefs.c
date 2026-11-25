@@ -7,15 +7,13 @@
  * <height>"); Use sets it in ENV:, Save also in ENVARC:, as the
  * Workbench's own preferences editors do.
  *
- * Only uses Kickstart/Workbench 1.3 functions (the datatype itself needs
- * 3.0).
+ * The window is made by a314gui (gadtools.library on 2.04 and later).
+ * Only needs Kickstart/Workbench 1.3 (the datatype itself needs 3.0).
  */
 
 #include <exec/types.h>
 #include <exec/memory.h>
-#include <graphics/text.h>
 #include <intuition/intuition.h>
-#include <intuition/screens.h>
 #include <workbench/startup.h>
 #include <libraries/dos.h>
 #include <libraries/dosextens.h>
@@ -29,26 +27,27 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../prefs/a314gui.h"
+
 #define DEFAULT_W	1280
 #define DEFAULT_H	1024
 #define MIN_SIZE	16
 #define MAX_SIZE	8192
 
-#define INNER_W		400
-#define INNER_H		104
-#define FIELD_X		208
-#define FIELD_W		64
-#define WIDTH_Y		30
-#define HEIGHT_Y	46
-#define BUTTON_Y	84
-#define BUTTON_W	96
-#define BUTTON_H	14
-
-#define GID_WIDTH	1
-#define GID_HEIGHT	2
-#define GID_SAVE	10
-#define GID_USE		11
-#define GID_CANCEL	12
+/* Gadgets and menu items */
+#define ID_TEXT1	1
+#define ID_TEXT2	2
+#define ID_WIDTH	3
+#define ID_HEIGHT	4
+#define ID_PIXELS1	5
+#define ID_PIXELS2	6
+#define ID_SAVE		10
+#define ID_USE		11
+#define ID_CANCEL	12
+#define ID_QUIT		20
+#define ID_DEFAULTS	21
+#define ID_LAST_SAVED	22
+#define ID_RESTORE	23
 
 struct IntuitionBase *IntuitionBase = NULL;
 struct GfxBase *GfxBase = NULL;
@@ -56,43 +55,51 @@ struct GfxBase *GfxBase = NULL;
 /* Set by the startup code when started from Workbench */
 extern struct WBStartup *_WBenchMsg;
 
-static struct TextAttr topaz8 = { (STRPTR)"topaz.font", 8, FS_NORMAL, FPF_ROMFONT };
-static struct TextFont *font = NULL;
-static struct Window *win = NULL;
-static struct RastPort *rp;
-static int ox, oy;
+static struct Gui *gui = NULL;
 static BOOL quit = FALSE;
 
-static char width_buf[8], height_buf[8], undo_buf[8];
-static struct StringInfo width_info = { (UBYTE *)width_buf, (UBYTE *)undo_buf, 0, sizeof(width_buf) };
-static struct StringInfo height_info = { (UBYTE *)height_buf, (UBYTE *)undo_buf, 0, sizeof(height_buf) };
-static SHORT field_xy[] = { -2,-2, FIELD_W+1,-2, FIELD_W+1,9, -2,9, -2,-2 };
-static struct Border field_border = { 0, 0, 1, 0, JAM1, 5, field_xy, NULL };
-static SHORT button_xy[] = { 0,0, BUTTON_W-1,0, BUTTON_W-1,BUTTON_H-1, 0,BUTTON_H-1, 0,0 };
-static struct Border button_border = { 0, 0, 1, 0, JAM1, 5, button_xy, NULL };
-static struct Gadget width_gadget, height_gadget, buttons[3];
-static struct IntuiText button_texts[3];
-static const char *button_labels[3] = { "Save", "Use", "Cancel" };
+static const struct GuiItem items[] =
+{
+	{ GUI_LABEL, ID_TEXT1, 0, 0, 50, 0, NULL, 0 },
+	{ GUI_LABEL, ID_TEXT2, 0, 1, 50, 0, NULL, 0 },
+	{ GUI_INTEGER, ID_WIDTH, 18, 2, 10, 0, "Largest _width", 0 },
+	{ GUI_LABEL, ID_PIXELS1, 29, 2, 8, 0, NULL, 0 },
+	{ GUI_INTEGER, ID_HEIGHT, 18, 3, 10, 0, "Largest _height", 0 },
+	{ GUI_LABEL, ID_PIXELS2, 29, 3, 8, 0, NULL, 0 },
+	{ GUI_BUTTON, ID_SAVE, 0, 5, 12, 0, "_Save", 0 },
+	{ GUI_BUTTON, ID_USE, 19, 5, 12, 0, "_Use", 0 },
+	{ GUI_BUTTON, ID_CANCEL, 38, 5, 12, 0, "_Cancel", 0 },
+};
+
+static const struct GuiMenu menus[] =
+{
+	{ GUI_MENU_TITLE, 0, 0, "Project" },
+	{ GUI_MENU_ITEM, 'Q', ID_QUIT, "Quit" },
+	{ GUI_MENU_TITLE, 0, 0, "Edit" },
+	{ GUI_MENU_ITEM, 'D', ID_DEFAULTS, "Reset to Defaults" },
+	{ GUI_MENU_ITEM, 'L', ID_LAST_SAVED, "Last Saved" },
+	{ GUI_MENU_ITEM, 'R', ID_RESTORE, "Restore" },
+	{ GUI_MENU_END, 0, 0, NULL }
+};
 
 /* Shows a message in the shell, or in a requester when started from
-   Workbench (where there is no shell). */
+   Workbench (where there is no shell) */
 static void report(const char *text)
 {
-	struct IntuiText body = { 0, 1, JAM2, 16, 8, NULL, (UBYTE *)text, NULL };
-	struct IntuiText ok = { 0, 1, JAM2, 6, 3, NULL, (UBYTE *)"OK", NULL };
-
 	if (!_WBenchMsg || !IntuitionBase)
 		printf("%s\n", text);
 	else
-		AutoRequest(win, &body, NULL, &ok, 0, 0, 8 * strlen(text) + 48, 54);
+		gui_message(gui, text);
 }
 
 /* ---------------------------------------------------------------------- */
 /* The setting                                                            */
 
-static void load_setting(LONG *w, LONG *h)
+/* Reads the setting from a directory (ENV: or ENVARC:); the defaults if
+   it isn't there */
+static void load_setting(const char *dir, LONG *w, LONG *h)
 {
-	char buf[32];
+	char buf[32], path[48];
 	struct Process *me = (struct Process *)FindTask(NULL);
 	APTR old = me->pr_WindowPtr;
 	BPTR fh;
@@ -100,8 +107,9 @@ static void load_setting(LONG *w, LONG *h)
 
 	*w = DEFAULT_W;
 	*h = DEFAULT_H;
+	sprintf(path, "%sA314/PictureSize", dir);
 	me->pr_WindowPtr = (APTR)-1;
-	fh = Open((STRPTR)"ENV:A314/PictureSize", MODE_OLDFILE);
+	fh = Open((STRPTR)path, MODE_OLDFILE);
 	me->pr_WindowPtr = old;
 	if (!fh)
 		return;
@@ -126,7 +134,7 @@ static BOOL write_setting(const char *dir, LONG w, LONG h)
 	LONG n;
 
 	sprintf(path, "%sA314", dir);
-	lock = CreateDir((STRPTR)path);
+	lock = CreateDir((STRPTR)path);	/* fails harmlessly if it exists */
 	if (lock)
 		UnLock(lock);
 	sprintf(path, "%sA314/PictureSize", dir);
@@ -143,17 +151,17 @@ static BOOL write_setting(const char *dir, LONG w, LONG h)
 	return TRUE;
 }
 
-static LONG field_value(struct StringInfo *si)
+static LONG limit(LONG v)
 {
-	LONG v = atol((char *)si->Buffer);
 	return v < MIN_SIZE ? MIN_SIZE : v > MAX_SIZE ? MAX_SIZE : v;
 }
 
+/* Use: ENV: only. Save: ENV: and ENVARC:. */
 static BOOL store_setting(BOOL save)
 {
 	struct Process *me = (struct Process *)FindTask(NULL);
 	APTR old = me->pr_WindowPtr;
-	LONG w = field_value(&width_info), h = field_value(&height_info);
+	LONG w = limit(gui_get_number(gui, ID_WIDTH)), h = limit(gui_get_number(gui, ID_HEIGHT));
 	BOOL ok;
 
 	me->pr_WindowPtr = (APTR)-1;
@@ -164,152 +172,17 @@ static BOOL store_setting(BOOL save)
 	return ok;
 }
 
+static void show(LONG w, LONG h)
+{
+	gui_set_number(gui, ID_WIDTH, w);
+	gui_set_number(gui, ID_HEIGHT, h);
+}
+
 /* ---------------------------------------------------------------------- */
-/* The window                                                             */
-
-static void init_gadgets(void)
-{
-	int i;
-
-	memset(&width_gadget, 0, sizeof(width_gadget));
-	width_gadget.LeftEdge = ox + FIELD_X;
-	width_gadget.TopEdge = oy + WIDTH_Y;
-	width_gadget.Width = FIELD_W;
-	width_gadget.Height = 8;
-	width_gadget.Flags = GFLG_GADGHCOMP;
-	width_gadget.Activation = GACT_RELVERIFY | GACT_LONGINT;
-	width_gadget.GadgetType = GTYP_STRGADGET;
-	width_gadget.GadgetRender = &field_border;
-	width_gadget.SpecialInfo = &width_info;
-	width_gadget.GadgetID = GID_WIDTH;
-
-	height_gadget = width_gadget;
-	height_gadget.TopEdge = oy + HEIGHT_Y;
-	height_gadget.SpecialInfo = &height_info;
-	height_gadget.GadgetID = GID_HEIGHT;
-
-	for (i = 0; i < 3; i++)
-	{
-		struct Gadget *g = &buttons[i];
-		struct IntuiText *t = &button_texts[i];
-		memset(t, 0, sizeof(*t));
-		t->FrontPen = 1;
-		t->DrawMode = JAM1;
-		t->LeftEdge = (BUTTON_W - 8 * (int)strlen(button_labels[i])) / 2;
-		t->TopEdge = 3;
-		t->ITextFont = &topaz8;
-		t->IText = (UBYTE *)button_labels[i];
-
-		memset(g, 0, sizeof(*g));
-		/* Save on the left, Cancel on the right, as in the Workbench's
-		   preferences editors */
-		g->LeftEdge = ox + 8 + i * (INNER_W - 16 - BUTTON_W) / 2;
-		g->TopEdge = oy + BUTTON_Y;
-		g->Width = BUTTON_W;
-		g->Height = BUTTON_H;
-		g->Flags = GFLG_GADGHCOMP;
-		g->Activation = GACT_RELVERIFY;
-		g->GadgetType = GTYP_BOOLGADGET;
-		g->GadgetRender = &button_border;
-		g->GadgetText = t;
-		g->GadgetID = GID_SAVE + i;
-	}
-}
-
-static void print_at(int x, int y, const char *s)
-{
-	Move(rp, ox + x, oy + y + font->tf_Baseline);
-	Text(rp, (STRPTR)s, strlen(s));
-}
-
-static BOOL open_window(void)
-{
-	struct Screen wb;
-	struct NewWindow nw;
-	int i;
-
-	if (!GetScreenData((APTR)&wb, sizeof(wb), WBENCHSCREEN, NULL))
-		return FALSE;
-
-	memset(&nw, 0, sizeof(nw));
-	nw.Width = INNER_W + wb.WBorLeft + wb.WBorRight;
-	nw.Height = INNER_H + wb.WBorTop + wb.Font->ta_YSize + 1 + wb.WBorBottom;
-	nw.LeftEdge = (wb.Width - nw.Width) / 2;
-	nw.TopEdge = wb.BarHeight + 2;
-	if (nw.LeftEdge < 0 || nw.TopEdge + nw.Height > wb.Height)
-		nw.LeftEdge = nw.TopEdge = 0;
-	nw.DetailPen = 0;
-	nw.BlockPen = 1;
-	nw.IDCMPFlags = IDCMP_CLOSEWINDOW | IDCMP_GADGETUP;
-	nw.Flags = WFLG_DRAGBAR | WFLG_DEPTHGADGET | WFLG_CLOSEGADGET |
-		WFLG_SMART_REFRESH | WFLG_NOCAREREFRESH | WFLG_ACTIVATE | WFLG_RMBTRAP;
-	nw.Title = (UBYTE *)"A314 Pictures";
-	nw.Type = WBENCHSCREEN;
-
-	win = OpenWindow(&nw);
-	if (!win)
-		return FALSE;
-	rp = win->RPort;
-	SetFont(rp, font);
-	SetDrMd(rp, JAM1);
-	ox = win->BorderLeft;
-	oy = win->BorderTop;
-
-	init_gadgets();
-	AddGadget(win, &width_gadget, -1);
-	AddGadget(win, &height_gadget, -1);
-	for (i = 0; i < 3; i++)
-		AddGadget(win, &buttons[i], -1);
-	RefreshGadgets(win->FirstGadget, win, NULL);
-
-	SetAPen(rp, 1);
-	print_at(8, 6, "Pictures larger than this are made");
-	print_at(8, 16, "smaller by the Pi before they are shown:");
-	print_at(48, WIDTH_Y, "Largest width");
-	print_at(48, HEIGHT_Y, "Largest height");
-	print_at(FIELD_X + FIELD_W + 8, WIDTH_Y, "pixels");
-	print_at(FIELD_X + FIELD_W + 8, HEIGHT_Y, "pixels");
-	print_at(8, 64, "(Pictures from WebP, AVIF, HEIC, JPEG XL, TIFF)");
-	return TRUE;
-}
-
-static void handle_window(void)
-{
-	struct IntuiMessage *im;
-
-	while ((im = (struct IntuiMessage *)GetMsg(win->UserPort)) != NULL)
-	{
-		ULONG cls = im->Class;
-		struct Gadget *g = (struct Gadget *)im->IAddress;
-		ReplyMsg((struct Message *)im);
-
-		if (cls == IDCMP_CLOSEWINDOW)
-			quit = TRUE;
-		else if (cls == IDCMP_GADGETUP)
-		{
-			switch (g->GadgetID)
-			{
-			case GID_WIDTH:
-				ActivateGadget(&height_gadget, win, NULL);
-				break;
-			case GID_SAVE:
-			case GID_USE:
-				if (store_setting(g->GadgetID == GID_SAVE))
-					quit = TRUE;
-				else
-					report("Unable to store the setting");
-				break;
-			case GID_CANCEL:
-				quit = TRUE;
-				break;
-			}
-		}
-	}
-}
 
 int main(void)
 {
-	LONG w, h;
+	LONG start_w, start_h, w, h;
 	int rc = 0;
 
 	IntuitionBase = (struct IntuitionBase *)OpenLibrary((STRPTR)"intuition.library", 0);
@@ -319,31 +192,61 @@ int main(void)
 		rc = 20;
 		goto cleanup;
 	}
-	load_setting(&w, &h);
-	sprintf(width_buf, "%ld", w);
-	sprintf(height_buf, "%ld", h);
-	width_info.LongInt = w;
-	height_info.LongInt = h;
 
-	font = OpenFont(&topaz8);
-	if (!font || !open_window())
+	load_setting("ENV:", &start_w, &start_h);
+	gui = gui_open("A314 Pictures Preferences", items, sizeof(items) / sizeof(items[0]), menus);
+	if (!gui)
 	{
 		report("Unable to open the window");
 		rc = 20;
 		goto cleanup;
 	}
+	gui_set_text(gui, ID_TEXT1, "Larger pictures are made smaller by the Pi");
+	gui_set_text(gui, ID_TEXT2, "(WebP, AVIF, HEIC, JPEG XL and TIFF pictures).");
+	gui_set_text(gui, ID_PIXELS1, "pixels");
+	gui_set_text(gui, ID_PIXELS2, "pixels");
+	show(start_w, start_h);
+
 	while (!quit)
 	{
-		Wait(1L << win->UserPort->mp_SigBit);
-		handle_window();
+		struct GuiEvent ev;
+		ULONG sig = Wait(gui_signal(gui) | SIGBREAKF_CTRL_C);
+		if (sig & SIGBREAKF_CTRL_C)
+			quit = TRUE;
+		while (!quit && gui_event(gui, &ev))
+		{
+			if (ev.type == GUI_EV_CLOSE)
+				quit = TRUE;
+			else switch (ev.id)
+			{
+			case ID_SAVE:
+			case ID_USE:
+				if (store_setting(ev.id == ID_SAVE))
+					quit = TRUE;
+				else
+					report("Unable to store the setting");
+				break;
+			case ID_CANCEL:
+			case ID_QUIT:
+				quit = TRUE;
+				break;
+			case ID_DEFAULTS:
+				show(DEFAULT_W, DEFAULT_H);
+				break;
+			case ID_LAST_SAVED:
+				load_setting("ENVARC:", &w, &h);
+				show(w, h);
+				break;
+			case ID_RESTORE:
+				show(start_w, start_h);
+				break;
+			}
+		}
 	}
 
 cleanup:
-	if (win)
-		CloseWindow(win);
-	win = NULL;
-	if (font)
-		CloseFont(font);
+	gui_close(gui);
+	gui = NULL;
 	if (GfxBase)
 		CloseLibrary((struct Library *)GfxBase);
 	if (IntuitionBase)

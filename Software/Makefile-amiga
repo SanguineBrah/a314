@@ -95,6 +95,6 @@ ${BIN}/Classes/DataTypes/a314sound.datatype: ${DT_COMMON} datatypes/a314sound.c
 	cp datatypes/DataTypes/* ${BIN}/Devs/DataTypes/
 
 all: ${BIN}/Prefs/A314/Pictures
-${BIN}/Prefs/A314/Pictures: datatypes/picturesprefs.c datatypes/Pictures.info ${BIN}/Prefs/A314.info
-	${VC} datatypes/picturesprefs.c -lamiga -o ${BIN}/Prefs/A314/Pictures
+${BIN}/Prefs/A314/Pictures: datatypes/picturesprefs.c prefs/a314gui.c prefs/a314gui.h datatypes/Pictures.info ${BIN}/Prefs/A314.info
+	${VC} datatypes/picturesprefs.c prefs/a314gui.c -lamiga -o ${BIN}/Prefs/A314/Pictures
 	cp datatypes/Pictures.info ${BIN}/Prefs/A314/Pictures.info
