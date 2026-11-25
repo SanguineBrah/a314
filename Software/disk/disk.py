@@ -50,6 +50,9 @@ class DiskService(object):
         self.a314d = A314d(SERVICE_NAME)
 
         self.control_server_socket = socket.socket()
+        # So that the service can start again straight away, while earlier
+        # control connections are still in TIME_WAIT
+        self.control_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.control_server_socket.bind(('localhost', 23890))
         self.control_server_socket.listen(10)
 
