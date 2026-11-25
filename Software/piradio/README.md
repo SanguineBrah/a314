@@ -19,6 +19,10 @@ On the Amiga:
 
 ## Running
 
+Copy *PiRadio* and *PiRadio.info* to a drawer and double-click the icon.
+PiAudio has to be running as well; it can also be started from its icon
+(see the [PiAudio README](../piaudio/README.md)). From the shell:
+
 ```
 run >NIL: PiAudio
 PiRadio

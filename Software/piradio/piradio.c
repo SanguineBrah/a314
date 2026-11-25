@@ -18,6 +18,7 @@
 #include <intuition/intuition.h>
 #include <intuition/screens.h>
 #include <libraries/dos.h>
+#include <workbench/startup.h>
 
 #include <proto/alib.h>
 #include <proto/exec.h>
@@ -118,6 +119,9 @@ struct Band
 struct IntuitionBase *IntuitionBase = NULL;
 struct GfxBase *GfxBase = NULL;
 
+/* Set by the startup code when started from Workbench */
+extern struct WBStartup *_WBenchMsg;
+
 /* The name the vbcc inline for RawKeyConvert() expects */
 struct Device *ConsoleDevice = NULL;
 static struct IOStdReq console_req;
@@ -172,6 +176,19 @@ static struct Gadget *active_slider = NULL;
 static char entry[12];		/* frequency being typed, in MHz */
 static int entry_len = -1;	/* -1 when not typing */
 static int blink = 0;
+
+/* Shows a message in the shell, or in a requester when started from
+   Workbench (where there is no shell). */
+static void report(const char *text)
+{
+	struct IntuiText body = { 0, 1, JAM2, 16, 8, NULL, (UBYTE *)text, NULL };
+	struct IntuiText ok = { 0, 1, JAM2, 6, 3, NULL, (UBYTE *)"OK", NULL };
+
+	if (!_WBenchMsg || !IntuitionBase)
+		printf("%s\n", text);
+	else
+		AutoRequest(win, &body, NULL, &ok, 0, 0, 8 * strlen(text) + 48, 54);
+}
 
 /* ---------------------------------------------------------------------- */
 /* Gadgets                                                                */
@@ -1338,7 +1355,7 @@ int main(void)
 	Permit();
 	if (!mp)
 	{
-		printf("PiRadio is already running\n");
+		report("PiRadio is already running");
 		rc = 5;
 		goto cleanup;
 	}
@@ -1351,13 +1368,13 @@ int main(void)
 		timer_req = (struct timerequest *)CreateExtIO(timer_mp, sizeof(struct timerequest));
 	if (!cmsg || !rmsg || !wmsg || !xmsg || !timer_req)
 	{
-		printf("Not enough memory\n");
+		report("Not enough memory");
 		rc = 20;
 		goto cleanup;
 	}
 	if (OpenDevice((STRPTR)TIMERNAME, UNIT_VBLANK, (struct IORequest *)timer_req, 0) != 0)
 	{
-		printf("Unable to open timer.device\n");
+		report("Unable to open timer.device");
 		rc = 20;
 		goto cleanup;
 	}
@@ -1380,7 +1397,7 @@ int main(void)
 	font = OpenFont(&topaz8);
 	if (!font || !open_window())
 	{
-		printf("Unable to open the window\n");
+		report("Unable to open the window");
 		rc = 20;
 		goto cleanup;
 	}
@@ -1457,6 +1474,7 @@ cleanup:
 
 	if (win)
 		CloseWindow(win);
+	win = NULL;	/* report() below must not use it */
 	if (font)
 		CloseFont(font);
 	if (ConsoleDevice)
@@ -1467,7 +1485,7 @@ cleanup:
 		/* The device still owns some requests. Freeing them could crash
 		   the machine later, so leave them, and the port, allocated. The
 		   port no longer signals this task, which is about to exit. */
-		printf("a314.device did not return all requests\n");
+		report("a314.device did not return all requests");
 		Forbid();
 		mp->mp_Flags = PA_IGNORE;
 		RemPort(mp);
