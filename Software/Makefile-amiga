@@ -33,6 +33,11 @@ ${BIN}/L/a314fs: a314device/a314.h a314device/proto_a314.h a314fs/messages.h a31
 	dd if=${BIN}/L/a314fs bs=1 skip=28 count=4 of=${BIN}/L/a314fs seek=32 conv=notrunc
 	rm ${BIN}/L/a314fs.asm
 
+all: ${BIN}/Devs/DOSDrivers/PD0
+${BIN}/Devs/DOSDrivers/PD0: disk/DOSDrivers/PD0 disk/DOSDrivers/PD1 disk/DOSDrivers/PD2 disk/DOSDrivers/PD3
+	mkdir -p ${BIN}/Devs/DOSDrivers
+	cp disk/DOSDrivers/PD? disk/DOSDrivers/PD?.info ${BIN}/Devs/DOSDrivers/
+
 ${BIN}/Devs/MountList: a314fs/a314fs-mountlist disk/Mountlist
 	cat a314fs/a314fs-mountlist disk/Mountlist > ${BIN}/Devs/MountList
 

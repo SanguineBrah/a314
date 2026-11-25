@@ -1,0 +1,18 @@
+/* PD1:, a disk drive whose disks are image files on the Raspberry Pi
+   (a314disk.device). Copy this file and its icon to DEVS:DOSDrivers to
+   have the drive at every start, or double-click the icon to mount it now.
+   The geometry is that of a double-density floppy disk. */
+Device         = a314disk.device
+Unit           = 1
+Flags          = 1
+Surfaces       = 2
+BlocksPerTrack = 11
+Reserved       = 2
+Interleave     = 0
+LowCyl         = 0
+HighCyl        = 79
+Buffers        = 2
+BufMemType     = 0
+MaxTransfer    = 5632
+Mount          = 1
+#

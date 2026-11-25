@@ -62,6 +62,16 @@ or `ro` (or `-` if the drive is empty) and the disk image:
 
 ## Mounting the drive
 
+On Workbench 2.0 and later, copy the files from `DOSDrivers` (`PD0` to `PD3`,
+with their icons; `make -f Makefile-amiga` puts them in
+`bin_amiga/Devs/DOSDrivers`) to `DEVS:DOSDrivers`. The drives are then there
+from every start, and a disk that the service inserts at start (see the
+Auto-insert section) is in the drive when Workbench appears. To mount a drive
+just once, double-click its icon instead. The drives have the geometry of a
+double-density floppy disk.
+
+On Kickstart 1.3, or to mount a drive from the shell, use the mount list:
+
 Before being able to use the virtual drive you have to mount it on the Amiga.
 This is done using the `Mount` command. If you have an entry for drive PD0: in
 the mount list file `DEVS:MountList` then you can mount PD0: with the command:
