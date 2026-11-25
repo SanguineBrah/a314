@@ -638,27 +638,35 @@ def draw_meter(c):
                     c.set(x, y, HILITE if c.get(x, y) == CREAM else CREAM)
 
 
+# A lamp lens, drawn by hand: B bezel, F face, R shaded rim, H highlight.
+# Hires pixels are almost twice as tall as they are wide, so 10 x 6 pixels
+# looks round.
+LED_LENS = [
+    '..BBBBBB..',
+    '.BFHHFFFB.',
+    'BFHFFFFFRB',
+    'BFFFFFFRRB',
+    '.BFFFRRRB.',
+    '..BBBBBB..',
+]
+
+
 def led(c, cx, cy, state):
-    ramps = {
-        'off': [BLACK, GUN_D, GUN, STEEL],
-        'green': [VFD_DIM, VFD, VFD, HILITE],
-        'red': [INK, RED, RED, AMBER, HILITE],
-        'amber': [WOOD, AMBER, AMBER, CREAM, HILITE],
+    """A round lamp lens, without dithering: at this size, mixed pixels
+    look like noise rather than shading."""
+    colours = {
+        # face, rim, highlight
+        'off': (GUN_D, BLACK, GUN),
+        'green': (VFD, VFD_DIM, HILITE),
+        'red': (RED, INK, AMBER),
+        'amber': (AMBER, WOOD_L, CREAM),
     }
-    ramp = ramps[state]
-    if state != 'off':
-        halo = {'green': VFD, 'red': RED, 'amber': AMBER}[state]
-        for x, y, nx, ny, r in ellipse_iter(cx, cy, 8.5, 4.6):
-            if r > 0.62 and bayer(x, y) < (1 - r) * 0.9:
-                c.set(x, y, halo)
-    for x, y, nx, ny, r in ellipse_iter(cx, cy, 5.2, 3.0):
-        if r > 0.86:
-            c.set(x, y, BLACK)
-            continue
-        u = r / 0.86
-        diff = max(0.0, -0.45 * nx - 0.55 * ny + 0.7 * math.sqrt(max(0, 1 - u * u)))
-        t = 0.2 + 0.55 * diff + 0.6 * diff ** 10
-        c.set(x, y, shade(ramp, t, x, y))
+    face, rim, hilite = colours[state]
+    pens = {'B': BLACK, 'F': face, 'R': rim, 'H': hilite}
+    for j, row in enumerate(LED_LENS):
+        for i, ch in enumerate(row):
+            if ch != '.':
+                c.set(cx - 5 + i, cy - 3 + j, pens[ch])
 
 
 def knob(c, cx, cy, rx, ry, cap, knurls, shadow=True):
