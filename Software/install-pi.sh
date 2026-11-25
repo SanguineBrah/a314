@@ -28,6 +28,7 @@ install_common() {
 	install remote-mouse/remote-mouse.py /opt/a314
 	install videoplayer/videoplayer.py /opt/a314
 	install pistats/pistats.py /opt/a314
+	install piwifi/piwifi.py /opt/a314
 	install a314sh/a314shd.py /opt/a314
 	install a314sh/a314sh.py /usr/local/bin/a314sh
 
