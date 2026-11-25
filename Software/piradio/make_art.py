@@ -553,13 +553,24 @@ def draw_panel(c):
         screw(c, sx, sy)
 
 
+# A slotted screw head, drawn by hand like the lamps: H highlight, L light
+# steel, M steel, D dark steel, S the slot, K shadow.
+SCREW_HEAD = [
+    '..LLLLL..',
+    '.LHHLLLM.',
+    'LSSSSSSSD',
+    '.LMMMMMD.',
+    '..DDDDDK.',
+    '...KKKK..',
+]
+
+
 def screw(c, cx, cy):
-    for x, y, nx, ny, r in ellipse_iter(cx, cy, 4.5, 2.6):
-        t = 0.45 + 0.4 * (-nx * 0.5 - ny * 0.6)
-        c.set(x, y, shade(R_METAL, t, x, y))
-    c.hline(cx - 3, cx + 3, cy, GUN_D)
-    c.set(cx - 4, cy + 2, BLACK)
-    c.hline(cx - 2, cx + 3, cy + 3, BLACK)
+    pens = {'H': HILITE, 'L': STEEL_L, 'M': STEEL, 'D': GUN, 'S': BLACK, 'K': BLACK}
+    for j, row in enumerate(SCREW_HEAD):
+        for i, ch in enumerate(row):
+            if ch != '.':
+                c.set(cx - 4 + i, cy - 2 + j, pens[ch])
 
 
 def draw_vfd(c):

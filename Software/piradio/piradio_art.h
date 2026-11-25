@@ -145,7 +145,7 @@ struct ArtSprite { WORD ax, ay, x, y, w, h; };
 #define SPR_COUNT	26
 
 extern const UWORD art_palette[16];
-extern const UBYTE art_background[30590];
+extern const UBYTE art_background[30579];
 extern const UBYTE art_atlas[3259];
 extern const struct ArtSprite art_sprites[SPR_COUNT];
 extern const UBYTE art_font_data[288];
