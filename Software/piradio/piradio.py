@@ -70,6 +70,7 @@ MODES = ('wbfm', 'fm', 'am', 'usb', 'lsb', 'raw')
 
 RETUNE_DELAY = 0.5              # quiet time after the last change before
                                 # rtl_fm is started again
+PIAUDIO_BLOCK = 1800            # bytes the piaudio service sends at a time
 PREFILL = OUT_RATE // 2         # bytes (0.25 s) held back after rtl_fm starts
 FADE = OUT_RATE // 50           # samples (20 ms) faded out and in when retuning
 RETRY_DELAY = 5.0               # after an error
@@ -511,6 +512,13 @@ class Radio(object):
             # little to have started playing)
             self.audio = b'' if self.prefilling else fade(self.audio, out=True)
             self.prefilling = False
+            # The piaudio service plays whole blocks, and keeps a part-filled
+            # one until more audio comes, which would play a scrap of the old
+            # station when rtl_fm starts again. A block of silence after the
+            # end fills it up, so that it is played now.
+            if self.pipe is not None:
+                self.audio += bytes(PIAUDIO_BLOCK)
+                self.write_audio()
         self.odd_byte = b''
 
     def fail(self, text):
