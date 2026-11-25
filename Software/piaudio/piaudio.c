@@ -32,6 +32,29 @@
 #define LEFT 0
 #define RIGHT 1
 
+/*
+ * Optional AHI output (piaudio AHI). AHI mixes PiAudio with other
+ * programs that play through AHI, instead of PiAudio taking two Paula
+ * channels for itself. These definitions are from devices/ahi.h of the
+ * AHI developer kit (version 4), so that building doesn't need it.
+ */
+#define AHINAME		"ahi.device"
+#define AHI_DEFAULT_UNIT	0
+#define AHIST_S8S	2	/* stereo, 8 bit signed */
+
+struct AHIRequest
+{
+	struct IOStdReq ahir_Std;
+	UWORD ahir_Version;
+	UWORD ahir_Pad1;
+	ULONG ahir_Private[2];
+	ULONG ahir_Type;
+	ULONG ahir_Frequency;
+	LONG ahir_Volume;		/* fixed point, 0x10000 is full volume */
+	LONG ahir_Position;		/* fixed point, 0x8000 is the middle */
+	struct AHIRequest *ahir_Link;
+};
+
 struct MsgPort *sync_mp = NULL;
 struct MsgPort *async_mp = NULL;
 
@@ -47,6 +70,12 @@ struct IOAudio *sync_audio_req = NULL;
 struct IOAudio *async_audio_req[4] = { NULL, NULL, NULL, NULL };
 
 ULONG allocated_channels;
+
+BOOL use_ahi = FALSE;
+BOOL ahi_device_open = FALSE;
+struct AHIRequest *ahi_req[2] = { NULL, NULL };
+BOOL ahi_pending[2] = { FALSE, FALSE };
+char *ahi_buffers[2] = { NULL, NULL };	/* interleaved stereo */
 
 BOOL a314_device_open = FALSE;
 BOOL audio_device_open = FALSE;
@@ -125,9 +154,124 @@ void submit_async_audio_req(int index)
 	BeginIO((struct IORequest *)async_audio_req[index]);
 }
 
-int main()
+/* Plays buffer index (0 or 2) through AHI. AHI wants the left and right
+   samples interleaved, so they are copied into ahi_buffers first. */
+void submit_ahi_req(int index)
+{
+	int slot = index >> 1, other = slot ^ 1, i;
+	char *left = audio_buffers[index + LEFT];
+	char *right = audio_buffers[index + RIGHT];
+	char *dst = ahi_buffers[slot];
+	struct AHIRequest *req = ahi_req[slot];
+
+	for (i = 0; i < SAMPLES; i++)
+	{
+		*dst++ = left[i];
+		*dst++ = right[i];
+	}
+
+	req->ahir_Std.io_Message.mn_ReplyPort = async_mp;
+	req->ahir_Std.io_Command = CMD_WRITE;
+	req->ahir_Std.io_Data = ahi_buffers[slot];
+	req->ahir_Std.io_Length = SAMPLES * 2;
+	req->ahir_Std.io_Offset = 0;
+	req->ahir_Type = AHIST_S8S;
+	req->ahir_Frequency = FREQ;
+	req->ahir_Volume = 0x10000;
+	req->ahir_Position = 0x8000;
+	/* Linking to the request that is playing makes AHI play this one
+	   straight after it, without a gap */
+	req->ahir_Link = ahi_pending[other] ? ahi_req[other] : NULL;
+	SendIO((struct IORequest *)req);
+	ahi_pending[slot] = TRUE;
+}
+
+/* Allocates a left and a right Paula channel through audio.device */
+BOOL open_paula()
+{
+	int i;
+
+	sync_audio_req = (struct IOAudio *)CreateExtIO(sync_mp, sizeof(struct IOAudio));
+	if (!sync_audio_req)
+	{
+		printf("Unable to allocate sync audio request\n");
+		return FALSE;
+	}
+
+	for (i = 0; i < 4; i++)
+	{
+		async_audio_req[i] = AllocMem(sizeof(struct IOAudio), MEMF_PUBLIC);
+		if (!async_audio_req[i])
+		{
+			printf("Unable to allocate async audio request\n");
+			return FALSE;
+		}
+	}
+
+	UBYTE which_channels[] = { L0 | R0, L0 | R1, L1 | R0, L1 | R1 };
+
+	sync_audio_req->ioa_Request.io_Message.mn_ReplyPort = sync_mp;
+	sync_audio_req->ioa_Request.io_Message.mn_Node.ln_Pri = 127;
+	sync_audio_req->ioa_Request.io_Command = ADCMD_ALLOCATE;
+	sync_audio_req->ioa_Request.io_Flags = ADIOF_NOWAIT;
+	sync_audio_req->ioa_AllocKey = 0;
+	sync_audio_req->ioa_Data = which_channels;
+	sync_audio_req->ioa_Length = sizeof(which_channels);
+
+	if (OpenDevice(AUDIONAME, 0, (struct IORequest *)sync_audio_req, 0))
+	{
+		printf("Unable to open audio.device\n");
+		return FALSE;
+	}
+
+	audio_device_open = TRUE;
+
+	allocated_channels = (ULONG)sync_audio_req->ioa_Request.io_Unit;
+
+	for (i = 0; i < 4; i++)
+		memcpy(async_audio_req[i], sync_audio_req, sizeof(struct IOAudio));
+
+	return TRUE;
+}
+
+/* Opens ahi.device instead of allocating Paula channels */
+BOOL open_ahi()
+{
+	int i;
+
+	for (i = 0; i < 2; i++)
+	{
+		ahi_req[i] = (struct AHIRequest *)CreateExtIO(async_mp, sizeof(struct AHIRequest));
+		ahi_buffers[i] = AllocMem(SAMPLES * 2, MEMF_PUBLIC | MEMF_CLEAR);
+		if (!ahi_req[i] || !ahi_buffers[i])
+		{
+			printf("Unable to allocate memory for AHI\n");
+			return FALSE;
+		}
+	}
+
+	ahi_req[0]->ahir_Version = 4;
+	if (OpenDevice(AHINAME, AHI_DEFAULT_UNIT, (struct IORequest *)ahi_req[0], 0))
+	{
+		printf("Unable to open ahi.device (AHI needs Kickstart 2.04 or later)\n");
+		return FALSE;
+	}
+	ahi_device_open = TRUE;
+	memcpy(ahi_req[1], ahi_req[0], sizeof(struct AHIRequest));
+	return TRUE;
+}
+
+int main(int argc, char **argv)
 {
 	LONG old_priority = SetTaskPri(FindTask(NULL), 50);
+
+	if (argc == 2 && (strcmp(argv[1], "AHI") == 0 || strcmp(argv[1], "ahi") == 0))
+		use_ahi = TRUE;
+	else if (argc > 1)
+	{
+		printf("Usage: piaudio [AHI]\n");
+		return 10;
+	}
 
 	sync_mp = CreatePort(NULL, 0);
 	if (!sync_mp)
@@ -200,46 +344,10 @@ int main()
 	audio_buffers[1] = audio_buffers[0] + SAMPLES;
 	audio_buffers[3] = audio_buffers[2] + SAMPLES;
 
-	sync_audio_req = (struct IOAudio *)CreateExtIO(sync_mp, sizeof(struct IOAudio));
-	if (!sync_audio_req)
-	{
-		printf("Unable to allocate sync audio request\n");
-		goto cleanup;
-	}
-
 	int i;
-	for (i = 0; i < 4; i++)
-	{
-		async_audio_req[i] = AllocMem(sizeof(struct IOAudio), MEMF_PUBLIC);
-		if (!async_audio_req[i])
-		{
-			printf("Unable to allocate async audio request\n");
-			goto cleanup;
-		}
-	}
 
-	UBYTE which_channels[] = { L0 | R0, L0 | R1, L1 | R0, L1 | R1 };
-
-	sync_audio_req->ioa_Request.io_Message.mn_ReplyPort = sync_mp;
-	sync_audio_req->ioa_Request.io_Message.mn_Node.ln_Pri = 127;
-	sync_audio_req->ioa_Request.io_Command = ADCMD_ALLOCATE;
-	sync_audio_req->ioa_Request.io_Flags = ADIOF_NOWAIT;
-	sync_audio_req->ioa_AllocKey = 0;
-	sync_audio_req->ioa_Data = which_channels;
-	sync_audio_req->ioa_Length = sizeof(which_channels);
-
-	if (OpenDevice(AUDIONAME, 0, (struct IORequest *)sync_audio_req, 0))
-	{
-		printf("Unable to open audio.device\n");
+	if (use_ahi ? !open_ahi() : !open_paula())
 		goto cleanup;
-	}
-
-	audio_device_open = TRUE;
-
-	allocated_channels = (ULONG)sync_audio_req->ioa_Request.io_Unit;
-
-	for (i = 0; i < 4; i++)
-		memcpy(async_audio_req[i], sync_audio_req, sizeof(struct IOAudio));
 
 	if (a314_connect(SERVICE_NAME) != A314_CONNECT_OK)
 	{
@@ -267,20 +375,31 @@ int main()
 		goto cleanup;
 	}
 
-	printf("PiAudio started, allocated channels: L%d, R%d\n",
-		(allocated_channels & LEFT_CHAN_MASK) == L0 ? 0 : 1,
-		(allocated_channels & RIGHT_CHAN_MASK) == R0 ? 0 : 1);
+	/* Requests per buffer: one for AHI, a left and a right one for Paula */
+	int reqs_per_buffer = use_ahi ? 1 : 2;
 
-	sync_audio_req->ioa_Request.io_Command = CMD_STOP;
-	DoIO((struct IORequest *)sync_audio_req);
+	if (use_ahi)
+	{
+		printf("PiAudio started, playing through AHI\n");
+		submit_ahi_req(back_index);
+	}
+	else
+	{
+		printf("PiAudio started, allocated channels: L%d, R%d\n",
+			(allocated_channels & LEFT_CHAN_MASK) == L0 ? 0 : 1,
+			(allocated_channels & RIGHT_CHAN_MASK) == R0 ? 0 : 1);
 
-	submit_async_audio_req(back_index + LEFT);
-	submit_async_audio_req(back_index + RIGHT);
+		sync_audio_req->ioa_Request.io_Command = CMD_STOP;
+		DoIO((struct IORequest *)sync_audio_req);
 
-	sync_audio_req->ioa_Request.io_Command = CMD_START;
-	DoIO((struct IORequest *)sync_audio_req);
+		submit_async_audio_req(back_index + LEFT);
+		submit_async_audio_req(back_index + RIGHT);
 
-	int pending_audio_reqs = 2;
+		sync_audio_req->ioa_Request.io_Command = CMD_START;
+		DoIO((struct IORequest *)sync_audio_req);
+	}
+
+	int pending_audio_reqs = reqs_per_buffer;
 
 	ULONG portsig = 1L << async_mp->mp_SigBit;
 
@@ -288,7 +407,7 @@ int main()
 
 	while (TRUE)
 	{
-		if (pending_audio_reqs <= 2)
+		if (pending_audio_reqs <= reqs_per_buffer)
 		{
 			back_index ^= 2;
 
@@ -299,10 +418,15 @@ int main()
 				ReadMemA314(dst, address, SAMPLES * 2);
 			}
 
-			submit_async_audio_req(back_index + LEFT);
-			submit_async_audio_req(back_index + RIGHT);
+			if (use_ahi)
+				submit_ahi_req(back_index);
+			else
+			{
+				submit_async_audio_req(back_index + LEFT);
+				submit_async_audio_req(back_index + RIGHT);
+			}
 
-			pending_audio_reqs += 2;
+			pending_audio_reqs += reqs_per_buffer;
 
 			if (!pending_a314_write)
 			{
@@ -328,7 +452,13 @@ int main()
 						goto cleanup;
 				}
 				else
+				{
+					if (msg == (struct Message *)ahi_req[0])
+						ahi_pending[0] = FALSE;
+					else if (msg == (struct Message *)ahi_req[1])
+						ahi_pending[1] = FALSE;
 					pending_audio_reqs--;
+				}
 			}
 		}
 	}
@@ -336,6 +466,23 @@ int main()
 cleanup:
 	if (stream_open)
 		a314_reset();
+	for (i = 0; i < 2; i++)
+	{
+		if (ahi_pending[i])
+		{
+			AbortIO((struct IORequest *)ahi_req[i]);
+			WaitIO((struct IORequest *)ahi_req[i]);
+		}
+	}
+	if (ahi_device_open)
+		CloseDevice((struct IORequest *)ahi_req[0]);
+	for (i = 0; i < 2; i++)
+	{
+		if (ahi_req[i])
+			DeleteExtIO((struct IORequest *)ahi_req[i]);
+		if (ahi_buffers[i])
+			FreeMem(ahi_buffers[i], SAMPLES * 2);
+	}
 	if (audio_device_open)
 		CloseDevice((struct IORequest *)sync_audio_req);
 	for (i = 3; i >= 0; i--)
