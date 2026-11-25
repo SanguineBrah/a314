@@ -70,6 +70,7 @@ MODES = ('wbfm', 'fm', 'am', 'usb', 'lsb', 'raw')
 
 RETUNE_DELAY = 0.5              # quiet time after the last change before
                                 # rtl_fm is started again
+PREFILL = OUT_RATE // 2         # bytes (0.25 s) held back after rtl_fm starts
 FADE = OUT_RATE // 50           # samples (20 ms) faded out and in when retuning
 RETRY_DELAY = 5.0               # after an error
 SWEEP_TIMEOUT = 30.0
@@ -310,6 +311,7 @@ class Radio(object):
         self.audio = b''            # converted audio waiting for the pipe
         self.odd_byte = b''
         self.fade_in = 0            # samples still to fade in after a start
+        self.prefilling = False     # holding back audio after a start
         self.last_audio = 0
         self.last_open = 0          # last time the squelch was open
         self.tuned_at = 0
@@ -498,14 +500,17 @@ class Radio(object):
         self.error = None
         self.tuned_at = time.time()
         self.fade_in = FADE
+        self.prefilling = True
 
     def stop_fm(self):
         if self.fm:
             self.fm.stop()
             self.fm = None
             # rtl_fm takes about 0.7 s to start again, so end the sound with
-            # a short fade rather than a click
-            self.audio = fade(self.audio, out=True)
+            # a short fade rather than a click (or drop it, if it was too
+            # little to have started playing)
+            self.audio = b'' if self.prefilling else fade(self.audio, out=True)
+            self.prefilling = False
         self.odd_byte = b''
 
     def fail(self, text):
@@ -590,6 +595,13 @@ class Radio(object):
         self.audio = b''
 
     def write_audio(self):
+        # rtl_fm sends a block every 0.12 s, and PiAudio plays a buffer in
+        # 0.11 s, so without some audio in reserve any delay is a skip.
+        # After a start, nothing is sent until there is a reserve.
+        if self.prefilling:
+            if len(self.audio) < PREFILL:
+                return
+            self.prefilling = False
         try:
             n = os.write(self.pipe, self.audio)
             self.audio = self.audio[n:]
