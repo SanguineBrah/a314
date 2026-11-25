@@ -19,27 +19,35 @@ done by the usual libraries, each of which is optional; a format whose
 library is missing is reported as not available:
 
 ```
-sudo apt install libwebp7 libheif1 libheif-plugin-dav1d libheif-plugin-libde265 libjxl0.11 libtiff6
+sudo apt install libwebp7 libwebpdemux2 libheif1 libheif-plugin-dav1d libheif-plugin-libde265 libjxl0.11 libtiff6
 ```
 
-(`libheif-plugin-dav1d` is for AVIF and `libheif-plugin-libde265` for
-HEIC.)
+(`libwebpdemux2` is for animated WebP, `libheif-plugin-dav1d` for AVIF and
+`libheif-plugin-libde265` for HEIC.)
 
 On the Amiga, `make -f Makefile-amiga` puts the files where they go on the
 system disk: copy `bin_amiga/Classes/DataTypes/a314picture.datatype` to
 SYS:Classes/DataTypes, and the descriptors in `bin_amiga/Devs/DataTypes` to
-DEVS:DataTypes. Then restart the Amiga (or run `AddDataTypes REFRESH`).
+DEVS:DataTypes, and the `Prefs/A314` drawer to SYS:Prefs. Then restart the
+Amiga (or run `AddDataTypes REFRESH`).
 
 ## Notes
 
-- Pictures larger than 1280 x 1024 are made smaller on the Pi, so that a
-  photo from a phone doesn't need tens of megabytes on the Amiga. The size
-  can be changed with the environment variable `A314/PictureSize`, for
-  example `SetEnv SAVE A314/PictureSize "800 600"`. HEIC and AVIF are
-  scaled smoothly by libheif; the other formats take the nearest pixel.
+- Pictures larger than 1280 x 1024 (640 x 512 on Workbench 3.0 and 3.1)
+  are made smaller on the Pi, so that a photo from a phone doesn't need tens
+  of megabytes on the Amiga. The size can be changed with Pictures in the
+  A314 drawer in Prefs (it is the environment variable
+  `A314/PictureSize`). HEIC and AVIF are scaled smoothly by libheif; the
+  other formats take the nearest pixel.
+- Each picture is decoded in a process of its own on the Pi, with limits
+  on its memory and time, so that a damaged or hostile file can't harm the
+  Pi or other pictures. Pictures with more pixels than the Pi has memory
+  for (up to 100 million) are refused.
 - Animated WebP and JPEG XL files show their first picture.
 - Only files can be shown, not pictures in the clipboard.
 - The descriptors are made by [make_descriptors.py](make_descriptors.py).
+  Their names end in "(A314)", so that they don't replace a descriptor
+  of another datatype for the same format.
 
 ## How it works
 

@@ -8,7 +8,13 @@
 #
 # The decoding is done by the usual libraries, through ctypes: libwebp,
 # libheif (with its AVIF and HEIC plugins), libjxl and libtiff. Each is
-# optional: a format whose library is missing is reported as unsupported.
+# optional: a format whose library is missing is reported as unavailable.
+#
+# Pictures come from anywhere, so each is decoded in a child process of
+# its own, with limits on its memory and time, after a check that the
+# picture isn't larger than this Pi can handle. A damaged or hostile file
+# can then only fail its own decoding, and several pictures can be decoded
+# at once.
 #
 # The file and the pixels go through a buffer in A314 memory that the
 # Amiga allocates; each step waits for the other side. The Amiga and this
@@ -28,18 +34,26 @@
 #   TAKEN                   the DATA was read
 #   INFO <w> <h> <file w> <file h> <format>   decoded; NEXT for the data
 #   ERR <code> <text>       code: 2000 unknown format, 2008 bad data,
-#                           2009 not available (no library), 103 no memory
+#                           2009 not available (no library), 103 too large
 #   PAL <n>                 n colours (r, g, b) are in the buffer
 #   ROWS <y> <n>            rows y to y + n - 1 are in the buffer
 #   DONE                    no more rows
+#
+# A row is never larger than the buffer: if it would be, the answer to
+# DECODE is ERR.
 
 import ctypes
 import ctypes.util
+import errno
 import logging
 import operator
 import os
+import resource
+import select
+import signal
 import struct
 import tempfile
+import time
 
 from a314d import A314d
 
@@ -51,6 +65,12 @@ SERVICE_NAME = 'picture'
 
 MAX_FILE = 64 * 1024 * 1024
 MAX_LINE = 251
+DECODE_SECONDS = 45             # the Amiga waits 60
+PHYS_MEM = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+# Decoding takes several times the size of the picture in memory; a
+# child may use at most half of the Pi's memory
+CHILD_MEM = min(PHYS_MEM // 2, 2 << 30)
+MAX_PIXELS = min(100 * 1000 * 1000, CHILD_MEM // 24)
 
 DTERROR_UNKNOWN_DATATYPE = 2000
 DTERROR_INVALID_DATA = 2008
@@ -64,19 +84,28 @@ class DecodeError(Exception):
         self.code = code
 
 
+_libs = {}
+
 def load(name):
-    path = ctypes.util.find_library(name)
-    if not path:
-        return None
-    try:
-        return ctypes.CDLL(path)
-    except OSError:
-        return None
+    if name not in _libs:
+        path = ctypes.util.find_library(name)
+        try:
+            _libs[name] = ctypes.CDLL(path) if path else None
+        except OSError:
+            _libs[name] = None
+    return _libs[name]
+
+
+def check_size(w, h):
+    if w <= 0 or h <= 0:
+        raise DecodeError(DTERROR_INVALID_DATA, 'bad picture size')
+    if w * h > MAX_PIXELS:
+        raise DecodeError(ERROR_NO_FREE_STORE, 'picture too large (%dx%d)' % (w, h))
 
 
 # ---------------------------------------------------------------------------
-# Decoders. Each returns (width, height, rgb bytes), or for HEIF also takes
-# the wanted size, as libheif can scale well itself.
+# Decoders. Each returns (width, height, rgb bytes). HEIF also takes the
+# wanted size, as libheif can scale well itself.
 
 def detect(data):
     if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
@@ -98,18 +127,72 @@ def decode_webp(data, maxw, maxh):
     lib = load('webp')
     if not lib:
         raise DecodeError(DTERROR_NOT_AVAILABLE, 'libwebp is not installed')
+    ip = ctypes.POINTER(ctypes.c_int)
+    lib.WebPGetInfo.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ip, ip]
     lib.WebPDecodeRGB.restype = ctypes.c_void_p
-    lib.WebPDecodeRGB.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
-        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+    lib.WebPDecodeRGB.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ip, ip]
     lib.WebPFree.argtypes = [ctypes.c_void_p]
     w, h = ctypes.c_int(0), ctypes.c_int(0)
+    if not lib.WebPGetInfo(data, len(data), ctypes.byref(w), ctypes.byref(h)):
+        raise DecodeError(DTERROR_INVALID_DATA, 'bad WebP data')
+    check_size(w.value, h.value)
     p = lib.WebPDecodeRGB(data, len(data), ctypes.byref(w), ctypes.byref(h))
     if not p:
-        raise DecodeError(DTERROR_INVALID_DATA, 'not a WebP picture that can be shown')
+        # An animation: its first frame
+        return decode_webp_animation(data)
     try:
         return w.value, h.value, ctypes.string_at(p, w.value * h.value * 3)
     finally:
         lib.WebPFree(p)
+
+
+def decode_webp_animation(data):
+    lib = load('webpdemux')
+    if not lib:
+        raise DecodeError(DTERROR_NOT_AVAILABLE, 'libwebpdemux is not installed')
+    WEBP_DEMUX_ABI_VERSION, MODE_RGBA = 0x0107, 1
+
+    class WebPData(ctypes.Structure):
+        _fields_ = [('bytes', ctypes.c_char_p), ('size', ctypes.c_size_t)]
+
+    class Options(ctypes.Structure):
+        _fields_ = [('color_mode', ctypes.c_int), ('use_threads', ctypes.c_int),
+                    ('padding', ctypes.c_uint32 * 7)]
+
+    class Info(ctypes.Structure):
+        _fields_ = [('canvas_width', ctypes.c_uint32), ('canvas_height', ctypes.c_uint32),
+                    ('loop_count', ctypes.c_uint32), ('bgcolor', ctypes.c_uint32),
+                    ('frame_count', ctypes.c_uint32), ('pad', ctypes.c_uint32 * 4)]
+
+    vp = ctypes.c_void_p
+    lib.WebPAnimDecoderOptionsInitInternal.argtypes = [ctypes.POINTER(Options), ctypes.c_int]
+    lib.WebPAnimDecoderNewInternal.restype = vp
+    lib.WebPAnimDecoderNewInternal.argtypes = [ctypes.POINTER(WebPData), ctypes.POINTER(Options), ctypes.c_int]
+    lib.WebPAnimDecoderGetInfo.argtypes = [vp, ctypes.POINTER(Info)]
+    lib.WebPAnimDecoderGetNext.argtypes = [vp, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int)]
+    lib.WebPAnimDecoderDelete.argtypes = [vp]
+
+    opts = Options()
+    if not lib.WebPAnimDecoderOptionsInitInternal(ctypes.byref(opts), WEBP_DEMUX_ABI_VERSION):
+        raise DecodeError(DTERROR_NOT_AVAILABLE, 'libwebpdemux version mismatch')
+    opts.color_mode = MODE_RGBA
+    wd = WebPData(data, len(data))
+    dec = lib.WebPAnimDecoderNewInternal(ctypes.byref(wd), ctypes.byref(opts), WEBP_DEMUX_ABI_VERSION)
+    if not dec:
+        raise DecodeError(DTERROR_INVALID_DATA, 'not a WebP picture that can be shown')
+    try:
+        info = Info()
+        if not lib.WebPAnimDecoderGetInfo(dec, ctypes.byref(info)):
+            raise DecodeError(DTERROR_INVALID_DATA, 'bad WebP animation')
+        w, h = info.canvas_width, info.canvas_height
+        check_size(w, h)
+        buf, ts = ctypes.c_void_p(), ctypes.c_int(0)
+        if not lib.WebPAnimDecoderGetNext(dec, ctypes.byref(buf), ctypes.byref(ts)) or not buf:
+            raise DecodeError(DTERROR_INVALID_DATA, 'bad WebP animation')
+        rgba = ctypes.string_at(buf, w * h * 4)
+    finally:
+        lib.WebPAnimDecoderDelete(dec)
+    return w, h, rgba_to_rgb(rgba, w, h)
 
 
 class HeifError(ctypes.Structure):
@@ -123,6 +206,7 @@ def decode_heif(data, maxw, maxh):
     vp = ctypes.c_void_p
     lib.heif_context_alloc.restype = vp
     lib.heif_context_free.argtypes = [vp]
+    lib.heif_context_set_maximum_image_size_limit.argtypes = [vp, ctypes.c_int]
     lib.heif_context_read_from_memory_without_copy.restype = HeifError
     lib.heif_context_read_from_memory_without_copy.argtypes = [vp, ctypes.c_char_p, ctypes.c_size_t, vp]
     lib.heif_context_get_primary_image_handle.restype = HeifError
@@ -133,6 +217,8 @@ def decode_heif(data, maxw, maxh):
     lib.heif_image_scale_image.argtypes = [vp, ctypes.POINTER(vp), ctypes.c_int, ctypes.c_int, vp]
     lib.heif_image_handle_get_width.argtypes = [vp]
     lib.heif_image_handle_get_height.argtypes = [vp]
+    lib.heif_image_get_width.argtypes = [vp, ctypes.c_int]
+    lib.heif_image_get_height.argtypes = [vp, ctypes.c_int]
     lib.heif_image_get_plane_readonly.restype = ctypes.POINTER(ctypes.c_ubyte)
     lib.heif_image_get_plane_readonly.argtypes = [vp, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
     lib.heif_image_release.argtypes = [vp]
@@ -142,24 +228,30 @@ def decode_heif(data, maxw, maxh):
     ctx = lib.heif_context_alloc()
     handle, img, scaled = vp(), vp(), vp()
     try:
+        lib.heif_context_set_maximum_image_size_limit(ctx, int(MAX_PIXELS ** 0.5))
         for e in (lib.heif_context_read_from_memory_without_copy(ctx, data, len(data), None),
                   lib.heif_context_get_primary_image_handle(ctx, ctypes.byref(handle))):
             if e.code:
                 raise DecodeError(DTERROR_INVALID_DATA, (e.message or b'bad HEIF data').decode('latin-1'))
+        check_size(lib.heif_image_handle_get_width(handle), lib.heif_image_handle_get_height(handle))
         e = lib.heif_decode_image(handle, ctypes.byref(img), HEIF_COLORSPACE_RGB,
             HEIF_CHROMA_INTERLEAVED_RGB, None)
         if e.code:
             raise DecodeError(DTERROR_INVALID_DATA, (e.message or b'cannot decode').decode('latin-1'))
-        w = lib.heif_image_handle_get_width(handle)
-        h = lib.heif_image_handle_get_height(handle)
         out = img
+        w = lib.heif_image_get_width(out, HEIF_CHANNEL_INTERLEAVED)
+        h = lib.heif_image_get_height(out, HEIF_CHANNEL_INTERLEAVED)
+        check_size(w, h)
         nw, nh = fit(w, h, maxw, maxh)
         if (nw, nh) != (w, h):
             if not lib.heif_image_scale_image(img, ctypes.byref(scaled), nw, nh, None).code:
-                out, w, h = scaled, nw, nh
+                out = scaled
+                # The size of what was made, not what was asked for
+                w = lib.heif_image_get_width(out, HEIF_CHANNEL_INTERLEAVED)
+                h = lib.heif_image_get_height(out, HEIF_CHANNEL_INTERLEAVED)
         stride = ctypes.c_int(0)
         plane = lib.heif_image_get_plane_readonly(out, HEIF_CHANNEL_INTERLEAVED, ctypes.byref(stride))
-        if not plane:
+        if not plane or w <= 0 or h <= 0 or stride.value < w * 3:
             raise DecodeError(DTERROR_INVALID_DATA, 'no picture data')
         raw = ctypes.string_at(plane, stride.value * h)
         rows = [raw[y * stride.value:y * stride.value + w * 3] for y in range(h)]
@@ -203,24 +295,28 @@ def decode_jxl(data, maxw, maxh):
     out = None
     w = h = 0
     try:
-        lib.JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE)
-        lib.JxlDecoderSetInput(dec, data, len(data))
+        if lib.JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE) or \
+                lib.JxlDecoderSetInput(dec, data, len(data)):
+            raise DecodeError(DTERROR_INVALID_DATA, 'bad JPEG XL data')
         lib.JxlDecoderCloseInput(dec)
-        while True:
+        for _ in range(16):     # a few events, never an endless loop
             st = lib.JxlDecoderProcessInput(dec)
             if st == JXL_DEC_BASIC_INFO:
                 info = ctypes.create_string_buffer(512)     # JxlBasicInfo is smaller
-                lib.JxlDecoderGetBasicInfo(dec, info)
+                if lib.JxlDecoderGetBasicInfo(dec, info):
+                    raise DecodeError(DTERROR_INVALID_DATA, 'bad JPEG XL data')
                 w, h = struct.unpack_from('=II', info.raw, 4)
-            elif st == JXL_DEC_NEED_IMAGE_OUT_BUFFER:
+                check_size(w, h)    # before libjxl makes its frame buffers
+            elif st == JXL_DEC_NEED_IMAGE_OUT_BUFFER and out is None:
                 size = ctypes.c_size_t(0)
-                lib.JxlDecoderImageOutBufferSize(dec, ctypes.byref(fmt), ctypes.byref(size))
+                if lib.JxlDecoderImageOutBufferSize(dec, ctypes.byref(fmt), ctypes.byref(size)) or \
+                        size.value != w * h * 3:
+                    raise DecodeError(DTERROR_INVALID_DATA, 'bad JPEG XL data')
                 out = ctypes.create_string_buffer(size.value)
-                lib.JxlDecoderSetImageOutBuffer(dec, ctypes.byref(fmt), out, size.value)
-            elif st == JXL_DEC_FULL_IMAGE:
+                if lib.JxlDecoderSetImageOutBuffer(dec, ctypes.byref(fmt), out, size.value):
+                    raise DecodeError(DTERROR_INVALID_DATA, 'bad JPEG XL data')
+            elif st in (JXL_DEC_FULL_IMAGE, JXL_DEC_SUCCESS):
                 break       # the first frame only
-            elif st == JXL_DEC_SUCCESS:
-                break
             else:
                 raise DecodeError(DTERROR_INVALID_DATA, 'bad JPEG XL data')
     finally:
@@ -257,20 +353,22 @@ def decode_tiff(data, maxw, maxh):
             lib.TIFFGetField(ctypes.c_void_p(tif), TIFFTAG_IMAGEWIDTH, ctypes.byref(w))
             lib.TIFFGetField(ctypes.c_void_p(tif), TIFFTAG_IMAGELENGTH, ctypes.byref(h))
             w, h = w.value, h.value
-            if not w or not h or w * h > 100 * 1000 * 1000:
-                raise DecodeError(DTERROR_INVALID_DATA, 'bad TIFF size')
+            check_size(w, h)
             raster = ctypes.create_string_buffer(w * h * 4)
             if not lib.TIFFReadRGBAImageOriented(tif, w, h, raster, ORIENTATION_TOPLEFT, 0):
                 raise DecodeError(DTERROR_INVALID_DATA, 'cannot read this TIFF')
         finally:
             lib.TIFFClose(tif)
     # Each pixel is a little-endian ABGR word: bytes R, G, B, A
-    rgba = raster.raw
+    return w, h, rgba_to_rgb(raster.raw, w, h)
+
+
+def rgba_to_rgb(rgba, w, h):
     rgb = bytearray(w * h * 3)
     rgb[0::3] = rgba[0::4]
     rgb[1::3] = rgba[1::4]
     rgb[2::3] = rgba[2::4]
-    return w, h, bytes(rgb)
+    return bytes(rgb)
 
 
 DECODERS = {'WebP': decode_webp, 'AVIF': decode_heif, 'HEIF': decode_heif,
@@ -354,6 +452,51 @@ def quantize(w, h, rgb, colours):
     return bytes(palette), bytes(index[k] for k in keys)
 
 
+def decode_all(data, maxw, maxh, mode, colours, bufsize):
+    # Everything that is done with the file; runs in the child process.
+    # Returns (w, h, file w, file h, format, palette or None, pixels).
+    fmt = detect(data)
+    if fmt is None:
+        raise DecodeError(DTERROR_UNKNOWN_DATATYPE, 'not a picture this service knows')
+    w, h, rgb = DECODERS[fmt](data, maxw, maxh)
+    if len(rgb) != w * h * 3:
+        raise DecodeError(DTERROR_INVALID_DATA, 'bad picture data')
+    src = (w, h)
+    nw, nh = fit(w, h, maxw, maxh)
+    if (nw, nh) != (w, h):
+        rgb = scale(w, h, rgb, nw, nh)
+        w, h = nw, nh
+    if mode == 'pal':
+        palette, pixels = quantize(w, h, rgb, max(2, min(256, colours)))
+    else:
+        palette, pixels = None, rgb
+    # Never more than the Amiga's buffer at once
+    if w * (1 if mode == 'pal' else 3) > bufsize or (palette and len(palette) > bufsize):
+        raise DecodeError(ERROR_NO_FREE_STORE, 'picture too wide for the buffer')
+    return w, h, src[0], src[1], fmt, palette, pixels
+
+
+def child(data, args, fd):
+    # The child process: limits, decoding, the result into the pipe
+    resource.setrlimit(resource.RLIMIT_DATA, (CHILD_MEM, CHILD_MEM))
+    resource.setrlimit(resource.RLIMIT_CPU, (DECODE_SECONDS, DECODE_SECONDS + 5))
+    try:
+        w, h, fw, fh, fmt, palette, pixels = decode_all(data, *args)
+        head = struct.pack('=BIIIII', 0, w, h, fw, fh, len(palette or b'')) + fmt.encode().ljust(16)
+        out = [head, palette or b'', pixels]
+    except DecodeError as e:
+        out = [struct.pack('=BI', 1, e.code) + str(e).encode('latin-1', 'replace')[:200]]
+    except MemoryError:
+        out = [struct.pack('=BI', 1, ERROR_NO_FREE_STORE) + b'not enough memory on the Pi']
+    except Exception as e:
+        out = [struct.pack('=BI', 1, DTERROR_INVALID_DATA) + ('cannot decode: %s' % e).encode('latin-1', 'replace')[:200]]
+    for part in out:
+        view = memoryview(part)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+
+
 # ---------------------------------------------------------------------------
 
 class Job(object):
@@ -366,10 +509,15 @@ class Job(object):
         self.data = bytearray()
         self.size = 0
         self.w = self.h = 0
-        self.pixels = None          # bytes per row: 3 (rgb) or 1 (pal)
+        self.pixels = None
         self.palette = None
         self.next_row = 0
         self.bpp = 3
+        self.pid = None             # the decoding child
+        self.pipe = None
+        self.result = bytearray()
+        self.deadline = 0
+        self.mode = 'rgb'
 
     def send(self, line):
         self.service.send(self.stream_id, line.encode('latin-1')[:MAX_LINE])
@@ -378,57 +526,89 @@ class Job(object):
         words = line.split()
         if not words:
             return
-        cmd, args = words[0], words[1:]
-        try:
-            if cmd == 'BUF' and len(args) == 2:
-                self.buf = (int(args[0]), int(args[1]))
-            elif cmd == 'FILE' and len(args) == 1:
-                self.size = min(int(args[0]), MAX_FILE)
-                self.data = bytearray()
-            elif cmd == 'DATA' and len(args) == 1 and self.buf:
-                n = min(int(args[0]), self.buf[1], self.size - len(self.data))
+        cmd, args = words[0], [int(a) if a.isdigit() else a for a in words[1:]]
+        nums = all(isinstance(a, int) for a in args)
+        if cmd == 'BUF' and len(args) == 2 and nums and args[1] > 0:
+            self.buf = (args[0], args[1])
+        elif cmd == 'FILE' and len(args) == 1 and nums:
+            if args[0] > MAX_FILE:
+                self.send('ERR %d file too large' % ERROR_NO_FREE_STORE)
+                return
+            self.size = args[0]
+            self.data = bytearray()
+        elif cmd == 'DATA' and len(args) == 1 and nums and self.buf:
+            n = min(args[0], self.buf[1], self.size - len(self.data))
+            if n > 0:
                 self.data += self.service.read_mem(self.buf[0], n)
-                self.send('TAKEN')
-            elif cmd == 'DECODE' and len(args) >= 3:
-                self.decode(int(args[0]), int(args[1]), args[2],
-                    int(args[3]) if len(args) > 3 else 256)
-            elif cmd == 'NEXT':
-                self.next_block()
-            else:
-                logger.warning('Unknown command %r', line[:40])
-        except ValueError:
-            logger.warning('Bad command %r', line[:40])
+            self.send('TAKEN')
+        elif cmd == 'DECODE' and len(args) >= 3 and isinstance(args[0], int) and isinstance(args[1], int) \
+                and self.buf and self.pid is None:
+            colours = args[3] if len(args) > 3 and isinstance(args[3], int) else 256
+            self.start_decode(max(16, args[0]), max(16, args[1]), args[2], colours)
+        elif cmd == 'NEXT' and self.pid is None:
+            self.next_block()
+        else:
+            logger.warning('Unexpected command %r', line[:40])
 
-    def decode(self, maxw, maxh, mode, colours):
+    def start_decode(self, maxw, maxh, mode, colours):
+        self.mode = 'pal' if mode == 'pal' else 'rgb'
         data = bytes(self.data)
         self.data = bytearray()
-        fmt = detect(data)
-        if fmt is None:
-            self.send('ERR %d not a picture this service knows' % DTERROR_UNKNOWN_DATATYPE)
-            return
-        maxw, maxh = max(16, maxw), max(16, maxh)
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            try:
+                child(data, (maxw, maxh, self.mode, colours, self.buf[1]), w)
+            finally:
+                os._exit(0)
+        os.close(w)
+        os.set_blocking(r, False)
+        self.pid, self.pipe = pid, r
+        self.result = bytearray()
+        self.deadline = time.time() + DECODE_SECONDS + 5
+
+    def child_output(self):
+        # Reads what the child has written; True when it has finished
         try:
-            w, h, rgb = DECODERS[fmt](data, maxw, maxh)
-        except DecodeError as e:
-            logger.info('%s: %s', fmt, e)
-            self.send('ERR %d %s' % (e.code, e))
-            return
-        except MemoryError:
-            self.send('ERR %d picture too large' % ERROR_NO_FREE_STORE)
-            return
-        src = (w, h)
-        nw, nh = fit(w, h, maxw, maxh)
-        if (nw, nh) != (w, h):
-            rgb = scale(w, h, rgb, nw, nh)
-            w, h = nw, nh
-        if mode == 'pal':
-            self.palette, self.pixels = quantize(w, h, rgb, max(2, min(256, colours)))
-            self.bpp = 1
+            d = os.read(self.pipe, 1 << 20)
+        except BlockingIOError:
+            return False
+        if d:
+            self.result += d
+            return False
+        self.finish_decode()
+        return True
+
+    def finish_decode(self, timed_out=False):
+        if timed_out:
+            os.kill(self.pid, signal.SIGKILL)
+        os.close(self.pipe)
+        _, status = os.waitpid(self.pid, 0)
+        self.pid = self.pipe = None
+        r = bytes(self.result)
+        self.result = bytearray()
+        if timed_out:
+            self.send('ERR %d decoding took too long' % DTERROR_INVALID_DATA)
+        elif r[:1] == b'\1' and len(r) >= 5:
+            self.send('ERR %d %s' % (struct.unpack_from('=I', r, 1)[0], r[5:].decode('latin-1')))
+        elif r[:1] == b'\0' and len(r) >= 37:
+            w, h, fw, fh, plen = struct.unpack_from('=IIIII', r, 1)
+            fmt = r[21:37].rstrip(b' ').decode()
+            self.bpp = 1 if self.mode == 'pal' else 3
+            self.palette = r[37:37 + plen] or None
+            self.pixels = r[37 + plen:]
+            if len(self.pixels) != w * h * self.bpp:
+                self.pixels = self.palette = None
+                self.send('ERR %d bad decoder result' % DTERROR_INVALID_DATA)
+                return
+            self.w, self.h, self.next_row = w, h, 0
+            logger.info('%s %dx%d, sent as %dx%d %s', fmt, fw, fh, w, h, self.mode)
+            self.send('INFO %d %d %d %d %s' % (w, h, fw, fh, fmt))
         else:
-            self.palette, self.pixels, self.bpp = None, rgb, 3
-        self.w, self.h, self.next_row = w, h, 0
-        logger.info('%s %dx%d, sent as %dx%d %s', fmt, src[0], src[1], w, h, mode)
-        self.send('INFO %d %d %d %d %s' % (w, h, src[0], src[1], fmt))
+            # Killed: a crash in a decoder, or over its memory or time
+            logger.warning('A decoder stopped (status %d)', status)
+            self.send('ERR %d the picture could not be decoded' % DTERROR_INVALID_DATA)
 
     def next_block(self):
         if self.pixels is None or not self.buf:
@@ -436,6 +616,10 @@ class Job(object):
             return
         address, size = self.buf
         if self.palette is not None:
+            if len(self.palette) > size:
+                self.pixels = self.palette = None
+                self.send('ERR %d palette too large' % DTERROR_INVALID_DATA)
+                return
             self.service.write_mem(address, self.palette)
             self.send('PAL %d' % (len(self.palette) // 3))
             self.palette = None
@@ -445,11 +629,22 @@ class Job(object):
             self.pixels = None
             self.send('DONE')
             return
-        n = max(1, min(size // row, self.h - self.next_row))
+        if row > size:      # checked when decoding, but never write past the buffer
+            self.pixels = None
+            self.send('ERR %d picture too wide' % ERROR_NO_FREE_STORE)
+            return
+        n = min(size // row, self.h - self.next_row)
         y = self.next_row
         self.service.write_mem(address, self.pixels[y * row:(y + n) * row])
         self.next_row += n
         self.send('ROWS %d %d' % (y, n))
+
+    def close(self):
+        if self.pid is not None:
+            os.kill(self.pid, signal.SIGKILL)
+            os.close(self.pipe)
+            os.waitpid(self.pid, 0)
+            self.pid = self.pipe = None
 
 
 class PictureService(object):
@@ -490,17 +685,33 @@ class PictureService(object):
         if job is None:
             return
         if ptype == A314d.MSG_DATA:
-            job.command(payload.decode('latin-1'))
+            try:
+                job.command(payload.decode('latin-1'))
+            except Exception as e:
+                # Never the service: bad commands only fail their picture
+                logger.warning('Command %r failed: %s', payload[:40], e)
+                job.send('ERR %d %s' % (DTERROR_INVALID_DATA, e))
         elif ptype in (A314d.MSG_EOS, A314d.MSG_RESET):
             if ptype == A314d.MSG_EOS:
                 self.a314d.send_eos(stream_id)
+            job.close()
             del self.jobs[stream_id]
 
     def run(self):
         while True:
             while self.pending:
                 self.handle_msg(*self.pending.pop(0))
-            self.handle_msg(*self.a314d.wait_for_msg())
+            pipes = {j.pipe: j for j in self.jobs.values() if j.pipe is not None}
+            rl, _, _ = select.select([self.a314d] + list(pipes), [], [], 1.0)
+            for fd in rl:
+                if fd in pipes:
+                    pipes[fd].child_output()
+            if self.a314d in rl:
+                self.handle_msg(*self.a314d.wait_for_msg())
+            now = time.time()
+            for j in list(self.jobs.values()):
+                if j.pid is not None and now > j.deadline:
+                    j.finish_decode(timed_out=True)
 
 
 if __name__ == '__main__':

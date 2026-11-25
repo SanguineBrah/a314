@@ -15,7 +15,8 @@
  * at most 256 colours.
  *
  * Pictures larger than the size in the environment variable
- * A314/PictureSize ("<width> <height>", default 1280 1024) are made
+ * A314/PictureSize ("<width> <height>", set with Prefs/A314/Pictures;
+ * default 1280 1024, or 640 512 with picture.datatype V40) are made
  * smaller on the Pi, to save memory on the Amiga.
  *
  * Datatypes need Kickstart/Workbench 3.0 or later.
@@ -60,7 +61,10 @@ struct Library *A314Base;
 #define BUF_SIZE	32768		/* A314 buffer, for the file and pixels */
 #define DEFAULT_W	1280
 #define DEFAULT_H	1024
-#define WAIT_SECONDS	10
+#define DEFAULT_W_V40	640		/* smaller for 3.0/3.1: chip RAM bitmap */
+#define DEFAULT_H_V40	512
+#define MAX_FILE	(64 * 1024 * 1024)	/* as picture.py */
+#define WAIT_SECONDS	20
 #define DECODE_SECONDS	60		/* large pictures take a while */
 
 struct ClassBase
@@ -140,8 +144,16 @@ static ULONG get_num(const char **pp)
 {
 	const char *p = *pp;
 	ULONG n = 0;
+	int digits = 0;
 	while (*p >= '0' && *p <= '9')
-		n = (n << 3) + (n << 1) + (*p++ - '0');
+	{
+		/* At most 9 digits; more makes a number too large to be valid */
+		if (++digits > 9)
+			n = 0x7fffffff;
+		else
+			n = (n << 3) + (n << 1) + (*p - '0');
+		p++;
+	}
 	while (*p == ' ')
 		p++;
 	*pp = p;
@@ -171,6 +183,7 @@ struct Conn
 	struct timerequest *timer;
 	ULONG socket;
 	BOOL connected, read_pending, write_pending, timer_open;
+	BOOL timed_out;			/* the Pi didn't answer something in time */
 	UBYTE in[256];
 	char line[256];
 	UBYTE out[64];
@@ -262,7 +275,8 @@ static BOOL conn_open(struct ClassBase *base, struct Conn *c)
 	return TRUE;
 }
 
-static void conn_close(struct Conn *c)
+/* Returns FALSE if the Pi didn't answer something in time */
+static BOOL conn_close(struct Conn *c)
 {
 	if (c->connected)
 	{
@@ -285,6 +299,7 @@ static void conn_close(struct Conn *c)
 		DeleteIORequest((struct IORequest *)c->read);
 	if (c->port)
 		DeleteMsgPort(c->port);
+	return !c->timed_out;
 }
 
 static BOOL send_line(struct Conn *c, char *end)
@@ -293,6 +308,7 @@ static BOOL send_line(struct Conn *c, char *end)
 	if (!wait_io(c, (struct IORequest *)c->write, WAIT_SECONDS))
 	{
 		c->write_pending = TRUE;	/* conn_close() waits for it */
+		c->timed_out = TRUE;
 		return FALSE;
 	}
 	return c->write->a314_Request.io_Error == A314_WRITE_OK;
@@ -302,8 +318,13 @@ static BOOL send_line(struct Conn *c, char *end)
 static const char *get_line(struct Conn *c, ULONG secs)
 {
 	ULONG n;
-	if (!c->read_pending || !wait_io(c, (struct IORequest *)c->read, secs))
+	if (!c->read_pending)
 		return NULL;
+	if (!wait_io(c, (struct IORequest *)c->read, secs))
+	{
+		c->timed_out = TRUE;
+		return NULL;
+	}
 	c->read_pending = FALSE;
 	if (c->read->a314_Request.io_Error != A314_READ_OK)
 		return NULL;
@@ -327,13 +348,15 @@ static ULONG get_attrs(Object *obj, ULONG tag1, ...)
 	return GetDTAttrsA(obj, (struct TagItem *)&tag1);
 }
 
-/* The largest size wanted, from A314/PictureSize */
-static void wanted_size(ULONG *w, ULONG *h)
+/* The largest size wanted, from A314/PictureSize (set with
+   Prefs/A314/Pictures); never so wide that a row doesn't fit the buffer */
+static void wanted_size(ULONG *w, ULONG *h, BOOL v43)
 {
 	char buf[32];
 	const char *p = buf;
-	*w = DEFAULT_W;
-	*h = DEFAULT_H;
+	ULONG maxw = v43 ? BUF_SIZE / 3 : BUF_SIZE;
+	*w = v43 ? DEFAULT_W : DEFAULT_W_V40;
+	*h = v43 ? DEFAULT_H : DEFAULT_H_V40;
 	if (GetVar("A314/PictureSize", buf, sizeof(buf), 0) > 0)
 	{
 		ULONG a = get_num(&p);
@@ -344,6 +367,10 @@ static void wanted_size(ULONG *w, ULONG *h)
 			*h = b;
 		}
 	}
+	if (*w > maxw)
+		*w = maxw;
+	if (*h > 32767)
+		*h = 32767;
 }
 
 /* Planar bitmap rows from chunky pixels (for picture.datatype V40) */
@@ -378,7 +405,7 @@ static void chunky_to_planar(struct BitMap *bm, UBYTE *src, ULONG y, ULONG rows,
 /* Loads the picture into obj; returns 0, or an error for IoErr() */
 static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 {
-	struct Conn conn, *c = &conn;
+	struct Conn *c;
 	struct BitMapHeader *bmh = NULL;
 	struct BitMap *bm = NULL;
 	ULONG source = 0, maxw, maxh, w, h, size, sent;
@@ -389,23 +416,34 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 	const char *p;
 	char *q;
 	LONG err = DTERROR_INVALID_DATA;
-	ULONG i;
+	BOOL buf_given = FALSE;	/* the Pi knows the buffer's address */
+	ULONG i, bpp = v43 ? 3 : 1;
 
-	{
-		UBYTE *b = (UBYTE *)c;
-		for (i = 0; i < sizeof(*c); i++)
-			b[i] = 0;
-	}
+	/* Not on the caller's stack, which may be small */
+	c = AllocVec(sizeof(struct Conn), MEMF_PUBLIC | MEMF_CLEAR);
+	if (!c)
+		return ERROR_NO_FREE_STORE;
 
 	get_attrs(obj, DTA_SourceType, (ULONG)&source, DTA_Handle, (ULONG)&fh,
 		PDTA_BitMapHeader, (ULONG)&bmh, TAG_DONE);
 	if (source != DTST_FILE || !fh || !bmh)
+	{
+		FreeVec(c);
 		return ERROR_OBJECT_WRONG_TYPE;
+	}
 
 	Seek(fh, 0, OFFSET_END);
 	size = Seek(fh, 0, OFFSET_BEGINNING);
 	if ((LONG)size <= 0)
+	{
+		FreeVec(c);
 		return DTERROR_NOT_ENOUGH_DATA;
+	}
+	if (size > MAX_FILE)
+	{
+		FreeVec(c);
+		return ERROR_NO_FREE_STORE;
+	}
 
 	tmp = AllocVec(BUF_SIZE, MEMF_PUBLIC);
 	a314buf = AllocMemA314(BUF_SIZE);
@@ -423,6 +461,7 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 	/* The file */
 	q = put_num(put_str((char *)c->out, "BUF "), a314buf);
 	*q++ = ' ';
+	buf_given = TRUE;
 	if (!send_line(c, put_num(q, BUF_SIZE)) ||
 		!send_line(c, put_num(put_str((char *)c->out, "FILE "), size)))
 		goto out;
@@ -436,13 +475,22 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 		}
 		WriteMemA314(a314buf, tmp, n);
 		if (!send_line(c, put_num(put_str((char *)c->out, "DATA "), n)) ||
-			!(p = get_line(c, WAIT_SECONDS)) || !starts_with(p, "TAKEN", &p))
+			!(p = get_line(c, WAIT_SECONDS)))
+			goto out;
+		if (starts_with(p, "ERR", &p))
+		{
+			err = get_num(&p);
+			if (!err)
+				err = DTERROR_INVALID_DATA;
+			goto out;
+		}
+		if (!starts_with(p, "TAKEN", &p))
 			goto out;
 		sent += n;
 	}
 
 	/* Decoding */
-	wanted_size(&maxw, &maxh);
+	wanted_size(&maxw, &maxh, v43);
 	q = put_num(put_str((char *)c->out, "DECODE "), maxw);
 	*q++ = ' ';
 	q = put_num(q, maxh);
@@ -452,13 +500,15 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 	if (starts_with(p, "ERR", &p))
 	{
 		err = get_num(&p);
+		if (!err)
+			err = DTERROR_INVALID_DATA;
 		goto out;
 	}
 	if (!starts_with(p, "INFO", &p))
 		goto out;
 	w = get_num(&p);
 	h = get_num(&p);
-	if (!w || !h || w > 32767 || h > 32767)
+	if (!w || !h || w > maxw || h > maxh || w * bpp > BUF_SIZE)
 		goto out;
 
 	bmh->bmh_Left = bmh->bmh_Top = 0;
@@ -499,6 +549,10 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 			if (n > 256)
 				goto out;
 			ReadMemA314(tmp, a314buf, n * 3);
+			/* All 256, so that no pixel can point outside the palette */
+			for (i = n * 3; i < 256 * 3; i++)
+				tmp[i] = 0;
+			n = 256;
 			set_attrs(obj, PDTA_NumColors, n, TAG_DONE);
 			get_attrs(obj, PDTA_ColorRegisters, (ULONG)&cr, PDTA_CRegs, (ULONG)&cregs, TAG_DONE);
 			if (!cr || !cregs)
@@ -517,8 +571,10 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 		{
 			ULONG y = get_num(&p);
 			ULONG n = get_num(&p);
-			ULONG row = v43 ? w * 3 : w;
-			if (y + n > h || n * row > BUF_SIZE)
+			ULONG row = w * bpp;
+			/* Written so that nothing can overflow: h <= 32767 and
+			   row <= BUF_SIZE (checked at INFO), so n * row fits */
+			if (n == 0 || n > h || y > h - n || n * row > BUF_SIZE)
 				goto out;
 			ReadMemA314(tmp, a314buf, n * row);
 			if (v43)
@@ -532,7 +588,11 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 				m.pbpa_Top = y;
 				m.pbpa_Width = w;
 				m.pbpa_Height = n;
-				DoSuperMethodA(cl, obj, (Msg)&m);
+				if (!DoSuperMethodA(cl, obj, (Msg)&m))
+				{
+					err = ERROR_NO_FREE_STORE;
+					goto out;
+				}
 			}
 			else
 				chunky_to_planar(bm, tmp, y, n, w);
@@ -552,11 +612,16 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 out:
 	if (bm)
 		FreeBitMap(bm);
-	conn_close(c);
+	/* After a time-out the Pi may still write into the buffer (a request
+	   it hadn't answered yet), so then it is left allocated: 32 KB lost,
+	   rather than other memory overwritten. */
+	if (!conn_close(c) && buf_given)
+		a314buf = INVALID_A314_ADDRESS;
 	if (a314buf != INVALID_A314_ADDRESS)
 		FreeMemA314(a314buf, BUF_SIZE);
 	if (tmp)
 		FreeVec(tmp);
+	FreeVec(c);
 	return err;
 }
 
