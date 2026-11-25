@@ -69,6 +69,7 @@ MAX_ACTIVE = 200
 MODES = ('wbfm', 'fm', 'am', 'usb', 'lsb', 'raw')
 
 RETUNE_DELAY = 0.2              # wait for more changes before restarting rtl_fm
+FADE = OUT_RATE // 50           # samples (20 ms) faded out and in when retuning
 RETRY_DELAY = 5.0               # after an error
 SWEEP_TIMEOUT = 30.0
 NO_AUDIO_TIMEOUT = 5.0          # rtl_fm hung (only checked with squelch off)
@@ -194,6 +195,26 @@ def load_config():
     return cfg
 
 
+def scale(byte, k):
+    # A signed 8-bit sample (as a byte) times k
+    v = byte - 256 if byte > 127 else byte
+    return int(v * k) & 0xff
+
+
+def fade(audio, out):
+    # Fades the last (out) or first FADE frames of 8-bit stereo audio
+    n = min(FADE, len(audio) // 2)
+    if not n:
+        return audio
+    if out:
+        head, tail = audio[:-2 * n], audio[-2 * n:]
+        tail = bytes(scale(b, (n - 1 - i // 2) / n) for i, b in enumerate(tail))
+        return head + tail
+    head, tail = audio[:2 * n], audio[2 * n:]
+    head = bytes(scale(b, (i // 2) / n) for i, b in enumerate(head))
+    return head + tail
+
+
 class Proc(object):
     # A child process (rtl_fm or rtl_power) with non-blocking output pipes.
 
@@ -287,6 +308,7 @@ class Radio(object):
         self.pipe_tried_at = 0
         self.audio = b''            # converted audio waiting for the pipe
         self.odd_byte = b''
+        self.fade_in = 0            # samples still to fade in after a start
         self.last_audio = 0
         self.last_open = 0          # last time the squelch was open
         self.tuned_at = 0
@@ -474,11 +496,15 @@ class Radio(object):
             return
         self.error = None
         self.tuned_at = time.time()
+        self.fade_in = FADE
 
     def stop_fm(self):
         if self.fm:
             self.fm.stop()
             self.fm = None
+            # rtl_fm takes about 0.7 s to start again, so end the sound with
+            # a short fade rather than a click
+            self.audio = fade(self.audio, out=True)
         self.odd_byte = b''
 
     def fail(self, text):
@@ -520,6 +546,13 @@ class Radio(object):
         self.level_n += len(samples)
         if self.vol != 8:
             samples = samples.translate(self.vol_table)
+        if self.fade_in:
+            # The start of a new rtl_fm: fade in, rather than a click
+            n = min(self.fade_in, len(samples))
+            done = FADE - self.fade_in
+            ramp = bytes(scale(b, (done + i) / FADE) for i, b in enumerate(samples[:n]))
+            samples = ramp + samples[n:]
+            self.fade_in -= n
         out = bytearray(2 * len(samples))
         out[0::2] = samples
         out[1::2] = samples
