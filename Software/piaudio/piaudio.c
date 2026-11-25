@@ -27,10 +27,11 @@
 #define BUFFER_LEN_MS 50
 #define SAMPLES (FREQ * BUFFER_LEN_MS / 1000)
 
-#define R0		1
-#define L0		2
-#define L1		4
-#define R1		8
+/* Paula's channels 0 and 3 are on the left output, 1 and 2 on the right */
+#define L0		1
+#define R0		2
+#define R1		4
+#define L1		8
 
 #define LEFT_CHAN_MASK	(L0 | L1)
 #define RIGHT_CHAN_MASK	(R0 | R1)
