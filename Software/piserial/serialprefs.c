@@ -8,17 +8,17 @@
  * Workbench's own preferences editors do. "auto" means the first free
  * port. The list of ports comes from the piserial service on the Pi.
  *
- * Only uses Kickstart/Workbench 1.3 functions.
+ * The window is made by a314gui (gadtools.library on 2.04 and later).
+ * Only needs Kickstart/Workbench 1.3.
  */
 
 #include <exec/types.h>
 #include <exec/memory.h>
 #include <exec/ports.h>
-#include <graphics/text.h>
 #include <intuition/intuition.h>
-#include <intuition/screens.h>
 #include <workbench/startup.h>
 #include <libraries/dos.h>
+#include <dos/dosextens.h>
 
 #include <proto/alib.h>
 #include <proto/exec.h>
@@ -32,6 +32,7 @@
 #include <time.h>
 
 #include "../a314device/a314.h"
+#include "../prefs/a314gui.h"
 
 #define SERVICE_NAME	"piserial"
 
@@ -40,23 +41,17 @@
 #define NAME_LEN	127		/* as in a314serial.device */
 #define DESC_LEN	60
 
-/* Layout, inside the window borders */
-#define INNER_W		560
-#define INNER_H		132
-#define UNIT_Y		22		/* first unit's button */
-#define UNIT_STEP	18
-#define CHOICE_X	72
-#define CHOICE_W	480
-#define BUTTON_H	14
-#define MSG_Y		98
-#define BUTTON_Y	114
-#define BUTTON_W	96
-
-#define GID_UNIT	1		/* 1 to 4 */
-#define GID_SAVE	10
-#define GID_USE		11
-#define GID_CANCEL	12
-#define GID_RESCAN	13
+/* Gadgets and menu items */
+#define ID_UNIT		1		/* 1 to 4 */
+#define ID_MSG		10
+#define ID_RESCAN	11
+#define ID_SAVE		12
+#define ID_USE		13
+#define ID_CANCEL	14
+#define ID_QUIT		20
+#define ID_DEFAULTS	21
+#define ID_LAST_SAVED	22
+#define ID_RESTORE	23
 
 struct Port
 {
@@ -71,11 +66,7 @@ struct GfxBase *GfxBase = NULL;
 /* Set by the startup code when started from Workbench */
 extern struct WBStartup *_WBenchMsg;
 
-static struct TextAttr topaz8 = { (STRPTR)"topaz.font", 8, FS_NORMAL, FPF_ROMFONT };
-static struct TextFont *font = NULL;
-static struct Window *win = NULL;
-static struct RastPort *rp;
-static int ox, oy;
+static struct Gui *gui = NULL;
 
 static struct MsgPort *mp = NULL;
 static struct A314_IORequest *cmsg = NULL, *rmsg = NULL, *wmsg = NULL, *xmsg = NULL;
@@ -93,19 +84,48 @@ static int nnew = 0;
 static BOOL have_list = FALSE;
 
 static char choice[UNITS][NAME_LEN + 1];	/* port name, or "" for automatic */
+static char start_choice[UNITS][NAME_LEN + 1];	/* as when the editor started */
 static BOOL quit = FALSE;
 
+/* The choices of each unit's cycle gadget: automatic, the ports, and a
+   chosen port that isn't plugged in */
+static char labels_text[UNITS][MAX_PORTS + 2][DESC_LEN + 24];
+static const char *labels[UNITS][MAX_PORTS + 2];
+static int nlabels[UNITS];
+
+static const struct GuiItem items[] =
+{
+	{ GUI_LABEL, ID_MSG + 100, 0, 0, 45, 0, "", 0 },
+	{ GUI_BUTTON, ID_RESCAN, 47, 0, 11, 0, "_Rescan", 0 },
+	{ GUI_CYCLE, ID_UNIT + 0, 9, 1, 49, 0, "Unit _0", 0 },
+	{ GUI_CYCLE, ID_UNIT + 1, 9, 2, 49, 0, "Unit _1", 0 },
+	{ GUI_CYCLE, ID_UNIT + 2, 9, 3, 49, 0, "Unit _2", 0 },
+	{ GUI_CYCLE, ID_UNIT + 3, 9, 4, 49, 0, "Unit _3", 0 },
+	{ GUI_TEXT, ID_MSG, 0, 5, 58, 0, NULL, 0 },
+	{ GUI_BUTTON, ID_SAVE, 0, 7, 12, 0, "_Save", 0 },
+	{ GUI_BUTTON, ID_USE, 23, 7, 12, 0, "_Use", 0 },
+	{ GUI_BUTTON, ID_CANCEL, 46, 7, 12, 0, "_Cancel", 0 },
+};
+
+static const struct GuiMenu menus[] =
+{
+	{ GUI_MENU_TITLE, 0, 0, "Project" },
+	{ GUI_MENU_ITEM, 'Q', ID_QUIT, "Quit" },
+	{ GUI_MENU_TITLE, 0, 0, "Edit" },
+	{ GUI_MENU_ITEM, 'D', ID_DEFAULTS, "Reset to Defaults" },
+	{ GUI_MENU_ITEM, 'L', ID_LAST_SAVED, "Last Saved" },
+	{ GUI_MENU_ITEM, 'R', ID_RESTORE, "Restore" },
+	{ GUI_MENU_END, 0, 0, NULL }
+};
+
 /* Shows a message in the shell, or in a requester when started from
-   Workbench (where there is no shell). */
+   Workbench (where there is no shell) */
 static void report(const char *text)
 {
-	struct IntuiText body = { 0, 1, JAM2, 16, 8, NULL, (UBYTE *)text, NULL };
-	struct IntuiText ok = { 0, 1, JAM2, 6, 3, NULL, (UBYTE *)"OK", NULL };
-
 	if (!_WBenchMsg || !IntuitionBase)
 		printf("%s\n", text);
 	else
-		AutoRequest(win, &body, NULL, &ok, 0, 0, 8 * strlen(text) + 48, 54);
+		gui_message(gui, text);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -176,7 +196,9 @@ static const char *archive_dir(void)
 	return "SYS:Prefs/Env-Archive/";
 }
 
-static void load_settings(void)
+/* Reads the settings: from ENV:, or failing that from the archive (or
+   only from the archive, for Last Saved) */
+static void load_settings(BOOL archive_only)
 {
 	char path[64];
 	struct Process *me = (struct Process *)FindTask(NULL);
@@ -186,8 +208,13 @@ static void load_settings(void)
 	me->pr_WindowPtr = (APTR)-1;
 	for (u = 0; u < UNITS; u++)
 	{
-		var_name(path, "ENV:", u);
-		if (!read_var(path, choice[u]))
+		BOOL found = FALSE;
+		if (!archive_only)
+		{
+			var_name(path, "ENV:", u);
+			found = read_var(path, choice[u]);
+		}
+		if (!found)
 		{
 			var_name(path, archive_dir(), u);
 			if (!read_var(path, choice[u]))
@@ -223,87 +250,7 @@ static BOOL store_settings(BOOL save)
 }
 
 /* ---------------------------------------------------------------------- */
-/* Gadgets and drawing                                                    */
-
-static SHORT choice_xy[] = { 0,0, CHOICE_W-1,0, CHOICE_W-1,BUTTON_H-1, 0,BUTTON_H-1, 0,0 };
-static struct Border choice_border = { 0, 0, 1, 0, JAM1, 5, choice_xy, NULL };
-static SHORT button_xy[] = { 0,0, BUTTON_W-1,0, BUTTON_W-1,BUTTON_H-1, 0,BUTTON_H-1, 0,0 };
-static struct Border button_border = { 0, 0, 1, 0, JAM1, 5, button_xy, NULL };
-
-static struct Gadget unit_gadgets[UNITS], buttons[4];
-static struct IntuiText button_texts[4];
-static const char *button_labels[4] = { "Save", "Use", "Cancel", "Rescan" };
-static const int button_ids[4] = { GID_SAVE, GID_USE, GID_CANCEL, GID_RESCAN };
-
-static void init_gadgets(void)
-{
-	int i;
-
-	for (i = 0; i < UNITS; i++)
-	{
-		struct Gadget *g = &unit_gadgets[i];
-		memset(g, 0, sizeof(*g));
-		g->LeftEdge = ox + CHOICE_X;
-		g->TopEdge = oy + UNIT_Y + i * UNIT_STEP;
-		g->Width = CHOICE_W;
-		g->Height = BUTTON_H;
-		g->Flags = GFLG_GADGHCOMP;
-		g->Activation = GACT_RELVERIFY;
-		g->GadgetType = GTYP_BOOLGADGET;
-		g->GadgetRender = &choice_border;
-		g->GadgetID = GID_UNIT + i;
-	}
-
-	for (i = 0; i < 4; i++)
-	{
-		struct Gadget *g = &buttons[i];
-		struct IntuiText *t = &button_texts[i];
-		memset(t, 0, sizeof(*t));
-		t->FrontPen = 1;
-		t->DrawMode = JAM1;
-		t->LeftEdge = (BUTTON_W - 8 * (int)strlen(button_labels[i])) / 2;
-		t->TopEdge = 3;
-		t->ITextFont = &topaz8;
-		t->IText = (UBYTE *)button_labels[i];
-
-		memset(g, 0, sizeof(*g));
-		/* Save on the left, Cancel on the right, as in the Workbench's
-		   preferences editors; Rescan goes with the port list */
-		if (i < 3)
-		{
-			g->LeftEdge = ox + 8 + i * (INNER_W - 16 - BUTTON_W) / 2;
-			g->TopEdge = oy + BUTTON_Y;
-		}
-		else
-		{
-			g->LeftEdge = ox + INNER_W - 8 - BUTTON_W;
-			g->TopEdge = oy + MSG_Y - 3;
-		}
-		g->Width = BUTTON_W;
-		g->Height = BUTTON_H;
-		g->Flags = GFLG_GADGHCOMP;
-		g->Activation = GACT_RELVERIFY;
-		g->GadgetType = GTYP_BOOLGADGET;
-		g->GadgetRender = &button_border;
-		g->GadgetText = t;
-		g->GadgetID = button_ids[i];
-	}
-}
-
-static void print_at(int x, int y, const char *s, int maxlen)
-{
-	int n = strlen(s);
-	if (n > maxlen)
-		n = maxlen;
-	Move(rp, ox + x, oy + y + font->tf_Baseline);
-	Text(rp, (STRPTR)s, n);
-}
-
-static void clear(int x, int y, int w, int h)
-{
-	SetAPen(rp, 0);
-	RectFill(rp, ox + x, oy + y, ox + x + w - 1, oy + y + h - 1);
-}
+/* The window                                                             */
 
 static struct Port *find_port(const char *name)
 {
@@ -314,64 +261,67 @@ static struct Port *find_port(const char *name)
 	return NULL;
 }
 
-static void draw_unit(int u)
+static void set_msg(const char *s)
 {
-	char text[NAME_LEN + 40];
-	struct Port *p;
-	int y = UNIT_Y + u * UNIT_STEP;
-
-	clear(CHOICE_X + 1, y + 1, CHOICE_W - 2, BUTTON_H - 2);
-	if (!choice[u][0])
-		strcpy(text, "Automatic (the first free port)");
-	else if ((p = find_port(choice[u])) != NULL)
-		sprintf(text, "%s%s", p->desc, p->free ? "" : "  (in use)");
-	else
-		sprintf(text, "%s%s", choice[u], have_list ? "  (not connected)" : "");
-	SetAPen(rp, 1);
-	print_at(CHOICE_X + 8, y + 3, text, (CHOICE_W - 16) / 8);
+	gui_set_text(gui, ID_MSG, s);
 }
 
-static void draw_all(void)
+/* Fills a unit's cycle gadget: automatic, every port, and the chosen
+   port if it isn't plugged in */
+static void show_unit(int u)
+{
+	int i, n = 0, active = 0;
+
+	strcpy(labels_text[u][n++], "Automatic (the first free port)");
+	for (i = 0; i < nports; i++)
+	{
+		sprintf(labels_text[u][n], "%s%s", ports[i].desc, ports[i].free ? "" : "  (in use)");
+		if (choice[u][0] && strcmp(choice[u], ports[i].name) == 0)
+			active = n;
+		n++;
+	}
+	if (choice[u][0] && !find_port(choice[u]))
+	{
+		sprintf(labels_text[u][n], "%.60s%s", choice[u], have_list ? "  (not connected)" : "");
+		active = n++;
+	}
+	for (i = 0; i < n; i++)
+		labels[u][i] = labels_text[u][i];
+	labels[u][n] = NULL;
+	nlabels[u] = n;
+	gui_set_cycle(gui, ID_UNIT + u, labels[u], n, active);
+}
+
+static void show_all(void)
 {
 	int u;
 	for (u = 0; u < UNITS; u++)
-		draw_unit(u);
+		show_unit(u);
 }
 
-static void set_msg(const char *s)
+/* A unit's cycle gadget was changed to choice a. A port is used by one
+   unit only, so a unit that had it goes back to automatic. */
+static void unit_changed(int u, int a)
 {
-	clear(8, MSG_Y, INNER_W - 24 - BUTTON_W, 8);
-	SetAPen(rp, 1);
-	print_at(8, MSG_Y, s, (INNER_W - 24 - BUTTON_W) / 8);
-}
+	int k;
 
-/* The next choice for a unit: automatic, then each port that no other
-   unit has, then automatic again. A chosen port that isn't plugged in is
-   shown as such, and kept unless the unit is changed. */
-static void next_choice(int u)
-{
-	int i, start = -1, k;
-
-	if (choice[u][0])
-		for (i = 0; i < nports; i++)
-			if (strcmp(ports[i].name, choice[u]) == 0)
-				start = i;
-	for (i = start + 1; i < nports; i++)
+	if (a <= 0)
+		choice[u][0] = '\0';
+	else if (a - 1 < nports)
 	{
+		strcpy(choice[u], ports[a - 1].name);
 		for (k = 0; k < UNITS; k++)
-			if (k != u && strcmp(choice[k], ports[i].name) == 0)
-				break;
-		if (k == UNITS)
-		{
-			strcpy(choice[u], ports[i].name);
-			return;
-		}
+			if (k != u && strcmp(choice[k], choice[u]) == 0)
+			{
+				choice[k][0] = '\0';
+				show_unit(k);
+			}
 	}
-	choice[u][0] = '\0';
+	/* else the port that isn't plugged in: kept */
 }
 
 /* ---------------------------------------------------------------------- */
-/* A314 connection: asks the Pi for its ports, once                       */
+/* A314 connection: asks the Pi for its ports                             */
 
 static void start_a314_cmd(struct A314_IORequest *ior, UWORD command, char *buffer, int length)
 {
@@ -444,7 +394,7 @@ static void handle_line(char *p, int len)
 		else
 			sprintf(text, "%d serial port%s found on the Pi", nports, nports == 1 ? "" : "s");
 		set_msg(text);
-		draw_all();
+		show_all();
 	}
 }
 
@@ -495,91 +445,47 @@ static void handle_a314_port(void)
 
 /* ---------------------------------------------------------------------- */
 
-static void handle_window(void)
+static void handle_event(struct GuiEvent *ev)
 {
-	struct IntuiMessage *im;
+	int u;
 
-	while ((im = (struct IntuiMessage *)GetMsg(win->UserPort)) != NULL)
+	if (ev->type == GUI_EV_CLOSE)
+		quit = TRUE;
+	else if (ev->type == GUI_EV_GADGET && ev->id >= ID_UNIT && ev->id < ID_UNIT + UNITS)
+		unit_changed(ev->id - ID_UNIT, (int)ev->value);
+	else
 	{
-		ULONG cls = im->Class;
-		struct Gadget *g = (struct Gadget *)im->IAddress;
-		ReplyMsg((struct Message *)im);
-
-		if (cls == IDCMP_CLOSEWINDOW)
-			quit = TRUE;
-		else if (cls == IDCMP_GADGETUP)
+		switch (ev->id)
 		{
-			int id = g->GadgetID;
-			if (id >= GID_UNIT && id < GID_UNIT + UNITS)
-			{
-				next_choice(id - GID_UNIT);
-				draw_unit(id - GID_UNIT);
-			}
-			else if (id == GID_SAVE || id == GID_USE)
-			{
-				if (store_settings(id == GID_SAVE))
-					quit = TRUE;
-				else
-					report("Unable to store the settings");
-			}
-			else if (id == GID_CANCEL)
+		case ID_SAVE:
+		case ID_USE:
+			if (store_settings(ev->id == ID_SAVE))
 				quit = TRUE;
-			else if (id == GID_RESCAN)
-				ask_for_ports();
+			else
+				report("Unable to store the settings");
+			break;
+		case ID_CANCEL:
+		case ID_QUIT:
+			quit = TRUE;
+			break;
+		case ID_RESCAN:
+			ask_for_ports();
+			break;
+		case ID_DEFAULTS:
+			for (u = 0; u < UNITS; u++)
+				choice[u][0] = '\0';
+			show_all();
+			break;
+		case ID_LAST_SAVED:
+			load_settings(TRUE);
+			show_all();
+			break;
+		case ID_RESTORE:
+			memcpy(choice, start_choice, sizeof(choice));
+			show_all();
+			break;
 		}
 	}
-}
-
-static BOOL open_window(void)
-{
-	struct Screen wb;
-	struct NewWindow nw;
-	int i;
-
-	if (!GetScreenData((APTR)&wb, sizeof(wb), WBENCHSCREEN, NULL))
-		return FALSE;
-
-	memset(&nw, 0, sizeof(nw));
-	nw.Width = INNER_W + wb.WBorLeft + wb.WBorRight;
-	nw.Height = INNER_H + wb.WBorTop + wb.Font->ta_YSize + 1 + wb.WBorBottom;
-	nw.LeftEdge = (wb.Width - nw.Width) / 2;
-	nw.TopEdge = wb.BarHeight + 2;
-	if (nw.LeftEdge < 0 || nw.TopEdge + nw.Height > wb.Height)
-		nw.LeftEdge = nw.TopEdge = 0;
-	nw.DetailPen = 0;
-	nw.BlockPen = 1;
-	nw.IDCMPFlags = IDCMP_CLOSEWINDOW | IDCMP_GADGETUP;
-	nw.Flags = WFLG_DRAGBAR | WFLG_DEPTHGADGET | WFLG_CLOSEGADGET |
-		WFLG_SMART_REFRESH | WFLG_NOCAREREFRESH | WFLG_ACTIVATE | WFLG_RMBTRAP;
-	nw.Title = (UBYTE *)"A314 Serial";
-	nw.Type = WBENCHSCREEN;
-
-	win = OpenWindow(&nw);
-	if (!win)
-		return FALSE;
-	rp = win->RPort;
-	SetFont(rp, font);
-	SetDrMd(rp, JAM1);
-
-	ox = win->BorderLeft;
-	oy = win->BorderTop;
-	init_gadgets();
-	for (i = 0; i < UNITS; i++)
-		AddGadget(win, &unit_gadgets[i], -1);
-	for (i = 0; i < 4; i++)
-		AddGadget(win, &buttons[i], -1);
-	RefreshGadgets(win->FirstGadget, win, NULL);
-
-	SetAPen(rp, 1);
-	print_at(8, 6, "The Pi serial port used by each unit of a314serial.device:", 68);
-	for (i = 0; i < UNITS; i++)
-	{
-		char label[8];
-		sprintf(label, "Unit %d", i);
-		print_at(8, UNIT_Y + i * UNIT_STEP + 3, label, 6);
-	}
-	draw_all();
-	return TRUE;
 }
 
 int main(void)
@@ -610,15 +516,18 @@ int main(void)
 		goto cleanup;
 	}
 
-	load_settings();
+	load_settings(FALSE);
+	memcpy(start_choice, choice, sizeof(choice));
 
-	font = OpenFont(&topaz8);
-	if (!font || !open_window())
+	gui = gui_open("A314 Serial Preferences", items, sizeof(items) / sizeof(items[0]), menus);
+	if (!gui)
 	{
 		report("Unable to open the window");
 		rc = 20;
 		goto cleanup;
 	}
+	gui_set_text(gui, ID_MSG + 100, "The Raspberry Pi serial port of each unit:");
+	show_all();
 
 	if (OpenDevice((STRPTR)A314_NAME, 0, (struct IORequest *)cmsg, 0) == 0)
 	{
@@ -631,16 +540,18 @@ int main(void)
 	else
 		set_msg("a314.device not found - is the A314 software installed?");
 
-	winsig = 1L << win->UserPort->mp_SigBit;
+	winsig = gui_signal(gui);
 	portsig = 1L << mp->mp_SigBit;
 
 	while (!quit)
 	{
+		struct GuiEvent ev;
 		ULONG sig = Wait(winsig | portsig | SIGBREAKF_CTRL_C);
 		if (sig & portsig)
 			handle_a314_port();
 		if (sig & winsig)
-			handle_window();
+			while (!quit && gui_event(gui, &ev))
+				handle_event(&ev);
 		if (sig & SIGBREAKF_CTRL_C)
 			quit = TRUE;
 	}
@@ -651,11 +562,8 @@ cleanup:
 		disconnect();
 		CloseDevice((struct IORequest *)cmsg);
 	}
-	if (win)
-		CloseWindow(win);
-	win = NULL;
-	if (font)
-		CloseFont(font);
+	gui_close(gui);
+	gui = NULL;
 	if (xmsg)
 		DeleteExtIO((struct IORequest *)xmsg);
 	if (wmsg)

@@ -84,6 +84,6 @@ ${BIN}/Devs/a314serial.device: a314device/a314.h piserial/romtag.asm piserial/de
 	${VC} piserial/romtag.asm piserial/device.c -O3 -nostdlib -o ${BIN}/Devs/a314serial.device -lamiga
 
 all: ${BIN}/Prefs/A314/Serial
-${BIN}/Prefs/A314/Serial: a314device/a314.h piserial/serialprefs.c piserial/Serial.info ${BIN}/Prefs/A314.info
-	${VC} piserial/serialprefs.c -lamiga -o ${BIN}/Prefs/A314/Serial
+${BIN}/Prefs/A314/Serial: a314device/a314.h piserial/serialprefs.c prefs/a314gui.c prefs/a314gui.h piserial/Serial.info ${BIN}/Prefs/A314.info
+	${VC} piserial/serialprefs.c prefs/a314gui.c -lamiga -o ${BIN}/Prefs/A314/Serial
 	cp piserial/Serial.info ${BIN}/Prefs/A314/Serial.info
