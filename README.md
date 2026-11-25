@@ -59,7 +59,7 @@ You may also launch Interactive applications using the pi command, such as `pi m
 
 - [*a314eth.device*](Software/ethernet) is a SANA-II driver that forwards Ethernet packets to the network interface of the RPi. Together with an Amiga TCP/IP stack this provides network access to the Amiga.
 
-- [*a314disk.device*](Software/disk) mounts an ADF or HDF file on the RPi as a disk drive on the Amiga.
+- [*a314disk.device*](Software/disk) mounts an ADF or HDF file on the RPi as a disk drive on the Amiga. The images can be chosen with Disks in Prefs/A314 ([A314 settings](Software/prefs)).
 
 - [*PiHid*](Software/hid) takes input events from mouse and keyboard that are
 connected to the RPI with USB, and forwards those input events to input.device

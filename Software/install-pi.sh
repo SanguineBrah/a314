@@ -29,6 +29,7 @@ install_common() {
 	install videoplayer/videoplayer.py /opt/a314
 	install pistats/pistats.py /opt/a314
 	install a314sh/a314shd.py /opt/a314
+	install prefs/a314prefs.py /opt/a314
 	install a314sh/a314sh.py /usr/local/bin/a314sh
 
 	# Write configuration files, but don't overwrite
@@ -37,6 +38,9 @@ install_common() {
 	[ -f /etc/opt/a314/a314fs.conf ] || modinstall a314fs/a314fs.conf /etc/opt/a314
 	[ -f /etc/opt/a314/disk.conf ] || modinstall disk/disk.conf /etc/opt/a314
 	[ -f /etc/opt/a314/scsi.conf ] || modinstall scsi/scsi.conf /etc/opt/a314
+	# The Disks tool in Prefs/A314 changes these (through a314prefs.py,
+	# which runs as the A314 user)
+	chown ${A314_USER}:${A314_GROUP} /etc/opt/a314/disk.conf /etc/opt/a314/scsi.conf
 
 	# Add shared directory for a314fs
 	sudo -u $A314_USER mkdir -p ${A314_HOME}/a314shared
