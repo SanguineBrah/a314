@@ -99,6 +99,13 @@ int gui_get_cycle(struct Gui *gui, UWORD id);
    closed), then it goes to the Workbench screen */
 void gui_message(struct Gui *gui, const char *text);
 
+/* A question in a requester with two buttons, e.g. "Connect|Cancel";
+   TRUE for the first */
+BOOL gui_ask(struct Gui *gui, const char *text, const char *buttons);
+
+/* Puts the cursor in a STRING or INTEGER item (2.0 and later) */
+void gui_activate(struct Gui *gui, UWORD id);
+
 /* The window, for a tool that needs it (e.g. for its own requesters) */
 struct Window *gui_window(struct Gui *gui);
 

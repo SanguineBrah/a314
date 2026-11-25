@@ -1162,3 +1162,42 @@ void gui_message(struct Gui *gui, const char *text)
 		AutoRequest(w, &body, NULL, &ok, 0, 0, 8 * strlen(text) + 48, 54);
 	}
 }
+
+BOOL gui_ask(struct Gui *gui, const char *text, const char *buttons)
+{
+	struct Window *w = gui ? gui->win : NULL;
+
+	if (IntuitionBase->LibNode.lib_Version >= 36)
+	{
+		struct EasyStruct es;
+		es.es_StructSize = sizeof(es);
+		es.es_Flags = 0;
+		es.es_Title = (UBYTE *)(gui && gui->title ? gui->title : "A314");
+		es.es_TextFormat = (UBYTE *)"%s";
+		es.es_GadgetFormat = (UBYTE *)buttons;
+		return EasyRequest(w, &es, NULL, (ULONG)text) == 1;
+	}
+	else
+	{
+		/* AutoRequest() takes two buttons: the text before and after '|' */
+		static char yes[32], no[32];
+		const char *bar = strchr(buttons, '|');
+		struct IntuiText body = { 0, 1, JAM2, 16, 8, NULL, (UBYTE *)text, NULL };
+		struct IntuiText t_yes = { 0, 1, JAM2, 6, 3, NULL, (UBYTE *)yes, NULL };
+		struct IntuiText t_no = { 0, 1, JAM2, 6, 3, NULL, (UBYTE *)no, NULL };
+		int n = bar ? bar - buttons : strlen(buttons);
+		int width = 8 * strlen(text) + 48;
+		strncpy(yes, buttons, n < 31 ? n : 31);
+		yes[n < 31 ? n : 31] = 0;
+		strncpy(no, bar ? bar + 1 : "Cancel", 31);
+		no[31] = 0;
+		return AutoRequest(w, &body, &t_yes, &t_no, 0, 0, width < 240 ? 240 : width, 54);
+	}
+}
+
+void gui_activate(struct Gui *gui, UWORD id)
+{
+	struct Item *t = find(gui, id);
+	if (t && t->gad && IntuitionBase->LibNode.lib_Version >= 36)
+		ActivateGadget(t->gad, gui->win, NULL);
+}
