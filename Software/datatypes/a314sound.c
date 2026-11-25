@@ -202,6 +202,14 @@ static LONG load(struct ClassBase *base, Object *obj)
 		set_attrs(obj, SDTA_Sample, (ULONG)samples[0], SDTA_SampleLength, length,
 			SDTA_Period, period, SDTA_Volume, 64, SDTA_Cycles, 1, TAG_DONE);
 	samples[0] = samples[1] = NULL;		/* the object has them now */
+	{
+		/* The file's name, as the object's name: MultiView shows it in
+		   its title bar, as it does for the system's own datatypes */
+		STRPTR name = NULL;
+		get_attrs(obj, DTA_Name, (ULONG)&name, TAG_DONE);
+		if (name)
+			set_attrs(obj, DTA_ObjName, (ULONG)name, TAG_DONE);
+	}
 	err = 0;
 
 out:

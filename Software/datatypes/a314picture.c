@@ -291,6 +291,14 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 		bm = NULL;	/* the object has it now */
 	}
 	set_attrs(obj, DTA_NominalHoriz, w, DTA_NominalVert, h, TAG_DONE);
+	{
+		/* The file's name, as the object's name: MultiView shows it in
+		   its title bar, as it does for the system's own datatypes */
+		STRPTR name = NULL;
+		get_attrs(obj, DTA_Name, (ULONG)&name, TAG_DONE);
+		if (name)
+			set_attrs(obj, DTA_ObjName, (ULONG)name, TAG_DONE);
+	}
 	err = 0;
 
 out:
