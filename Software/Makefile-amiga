@@ -79,14 +79,22 @@ endif
 ${BIN}/C/A314shd: a314device/a314.h a314sh/a314shd.c
 	${VC} a314sh/a314shd.c -lamiga -o ${BIN}/C/A314shd
 
-# The datatype, and its descriptors (made by picture/make_descriptors.py)
+# The datatypes, and their descriptors (made by datatypes/make_descriptors.py)
+DT_COMMON=a314device/a314.h a314device/proto_a314.h datatypes/romtag.asm datatypes/a314dt.c datatypes/a314dt.h
+
 all: ${BIN}/Classes/DataTypes/a314picture.datatype
-${BIN}/Classes/DataTypes/a314picture.datatype: a314device/a314.h a314device/proto_a314.h picture/romtag.asm picture/a314picture.c
+${BIN}/Classes/DataTypes/a314picture.datatype: ${DT_COMMON} datatypes/a314picture.c
 	mkdir -p ${BIN}/Classes/DataTypes ${BIN}/Devs/DataTypes
-	${VC} picture/romtag.asm picture/a314picture.c -O3 -nostdlib -o ${BIN}/Classes/DataTypes/a314picture.datatype -lamiga
-	cp picture/DataTypes/* ${BIN}/Devs/DataTypes/
+	${VC} datatypes/romtag.asm datatypes/a314picture.c datatypes/a314dt.c -O3 -nostdlib -o ${BIN}/Classes/DataTypes/a314picture.datatype -lamiga
+	cp datatypes/DataTypes/* ${BIN}/Devs/DataTypes/
+
+all: ${BIN}/Classes/DataTypes/a314sound.datatype
+${BIN}/Classes/DataTypes/a314sound.datatype: ${DT_COMMON} datatypes/a314sound.c
+	mkdir -p ${BIN}/Classes/DataTypes ${BIN}/Devs/DataTypes
+	${VC} datatypes/romtag.asm datatypes/a314sound.c datatypes/a314dt.c -O3 -nostdlib -o ${BIN}/Classes/DataTypes/a314sound.datatype -lamiga
+	cp datatypes/DataTypes/* ${BIN}/Devs/DataTypes/
 
 all: ${BIN}/Prefs/A314/Pictures
-${BIN}/Prefs/A314/Pictures: picture/pictureprefs.c picture/Pictures.info ${BIN}/Prefs/A314.info
-	${VC} picture/pictureprefs.c -lamiga -o ${BIN}/Prefs/A314/Pictures
-	cp picture/Pictures.info ${BIN}/Prefs/A314/Pictures.info
+${BIN}/Prefs/A314/Pictures: datatypes/picturesprefs.c datatypes/Pictures.info ${BIN}/Prefs/A314.info
+	${VC} datatypes/picturesprefs.c -lamiga -o ${BIN}/Prefs/A314/Pictures
+	cp datatypes/Pictures.info ${BIN}/Prefs/A314/Pictures.info

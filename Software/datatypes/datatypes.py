@@ -1,13 +1,16 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-# Picture service: decodes pictures for a314picture.datatype, so that
-# Amiga programs that use datatypes (MultiView and many others) can show
-# formats that the Amiga has no datatype for: WebP, AVIF, HEIC, JPEG XL
-# and TIFF. Pictures larger than the Amiga asks for are made smaller.
+# Datatypes service: decodes pictures and sounds for a314picture.datatype
+# and a314sound.datatype, so that Amiga programs that use datatypes
+# (MultiView and many others) can show and play formats that the Amiga has
+# no datatype for: pictures in WebP, AVIF, HEIC, JPEG XL and TIFF, and
+# sounds in MP3, FLAC and Ogg (Vorbis and Opus). Pictures larger than the
+# Amiga asks for are made smaller; sounds are resampled for Paula.
 #
 # The decoding is done by the usual libraries, through ctypes: libwebp,
-# libheif (with its AVIF and HEIC plugins), libjxl and libtiff. Each is
+# libheif (with its AVIF and HEIC plugins), libjxl, libtiff, libsndfile
+# (and libmpg123 for MP3 if libsndfile can't), and libsamplerate. Each is
 # optional: a format whose library is missing is reported as unavailable.
 #
 # Pictures come from anywhere, so each is decoded in a child process of
@@ -25,10 +28,16 @@
 #   FILE <size>             a file of this size follows
 #   DATA <n>                n bytes of the file are at the start of the buffer
 #   DECODE <maxw> <maxh> <mode> [<colours>]
-#                           decode, no larger than maxw x maxh; mode is rgb
-#                           (3 bytes a pixel) or pal (a palette of up to
-#                           <colours> colours, then 1 byte a pixel)
-#   NEXT                    the next block, after INFO, PAL or ROWS
+#                           decode a picture, no larger than maxw x maxh;
+#                           mode is rgb (3 bytes a pixel) or pal (a palette
+#                           of up to <colours> colours, then 1 byte a pixel)
+#   SOUND <rate> <channels> <maxbytes> <clock>
+#                           decode a sound into 8-bit samples, at most this
+#                           rate, 1 or 2 channels, at most maxbytes for each
+#                           channel; clock is the Amiga's audio clock (for
+#                           the period)
+#   NEXT                    the next block, after INFO, PAL, ROWS, SINFO
+#                           or PCM
 #
 # Pi -> Amiga:
 #   TAKEN                   the DATA was read
@@ -37,7 +46,11 @@
 #                           2009 not available (no library), 103 too large
 #   PAL <n>                 n colours (r, g, b) are in the buffer
 #   ROWS <y> <n>            rows y to y + n - 1 are in the buffer
-#   DONE                    no more rows
+#   SINFO <rate> <channels> <length> <period> <file rate> <seconds> <format>
+#                           decoded: length bytes for each channel; the
+#                           sound was cut short if it was longer
+#   PCM <channel> <offset> <n>   n bytes of a channel are in the buffer
+#   DONE                    no more rows or samples
 #
 # A row is never larger than the buffer: if it would be, the answer to
 # DECODE is ERR.
@@ -61,7 +74,7 @@ logging.basicConfig(format = '%(levelname)s, %(asctime)s, %(name)s, line %(linen
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-SERVICE_NAME = 'picture'
+SERVICE_NAME = 'datatypes'
 
 MAX_FILE = 64 * 1024 * 1024
 MAX_LINE = 251
@@ -377,6 +390,195 @@ def rgba_to_rgb(rgba, w, h):
     return bytes(rgb)
 
 
+# ---------------------------------------------------------------------------
+# Sounds
+
+class SfInfo(ctypes.Structure):
+    _fields_ = [('frames', ctypes.c_int64), ('samplerate', ctypes.c_int), ('channels', ctypes.c_int),
+                ('format', ctypes.c_int), ('sections', ctypes.c_int), ('seekable', ctypes.c_int)]
+
+SOUND_FORMATS = {0x170000: 'FLAC', 0x200000: 'Ogg', 0x230000: 'MP3'}
+MAX_SOUND_BYTES = 64 * 1024 * 1024
+
+
+def detect_sound(data):
+    if data[:4] == b'fLaC':
+        return 'FLAC'
+    if data[:4] == b'OggS':
+        return 'Ogg'
+    if data[:3] == b'ID3' or (len(data) > 1 and data[0] == 0xff and data[1] & 0xe0 == 0xe0):
+        return 'MP3'
+    return None
+
+
+def read_sndfile(data, max_frames):
+    # Returns (rate, channels, frames as float32 bytes, format name)
+    lib = load('sndfile')
+    if not lib:
+        raise DecodeError(DTERROR_NOT_AVAILABLE, 'libsndfile is not installed')
+    vp = ctypes.c_void_p
+    SFM_READ = 0x10
+    lib.sf_open.restype = vp
+    lib.sf_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(SfInfo)]
+    lib.sf_readf_float.restype = ctypes.c_int64
+    lib.sf_readf_float.argtypes = [vp, vp, ctypes.c_int64]
+    lib.sf_close.argtypes = [vp]
+    fd, path = tempfile.mkstemp(suffix='.snd')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        info = SfInfo()
+        snd = lib.sf_open(path.encode(), SFM_READ, ctypes.byref(info))
+    finally:
+        os.unlink(path)
+    if not snd:
+        return None
+    try:
+        rate, ch = info.samplerate, info.channels
+        if not 1000 <= rate <= 384000 or not 1 <= ch <= 16:
+            raise DecodeError(DTERROR_INVALID_DATA, 'bad sound format')
+        chunks, total = [], 0
+        block = 65536
+        buf = ctypes.create_string_buffer(block * ch * 4)
+        while total < max_frames:
+            n = lib.sf_readf_float(snd, buf, min(block, max_frames - total))
+            if n <= 0:
+                break
+            chunks.append(buf.raw[:n * ch * 4])
+            total += n
+    finally:
+        lib.sf_close(snd)
+    return rate, ch, b''.join(chunks), SOUND_FORMATS.get(info.format & 0x0FFF0000, 'sound')
+
+
+def read_mp3(data, max_frames):
+    # MP3 with libmpg123, if libsndfile can't (older libsndfile has no MP3)
+    lib = load('mpg123')
+    if not lib:
+        raise DecodeError(DTERROR_NOT_AVAILABLE, 'libmpg123 is not installed')
+    vp = ctypes.c_void_p
+    MPG123_ENC_FLOAT_32, MPG123_NEED_MORE, MPG123_NEW_FORMAT, MPG123_OK = 0x200, -10, -11, 0
+    lib.mpg123_new.restype = vp
+    lib.mpg123_new.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+    lib.mpg123_delete.argtypes = [vp]
+    lib.mpg123_open_feed.argtypes = [vp]
+    lib.mpg123_feed.argtypes = [vp, ctypes.c_char_p, ctypes.c_size_t]
+    lib.mpg123_read.argtypes = [vp, vp, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    lib.mpg123_format_none.argtypes = [vp]
+    lib.mpg123_format.argtypes = [vp, ctypes.c_long, ctypes.c_int, ctypes.c_int]
+    lib.mpg123_getformat.argtypes = [vp, ctypes.POINTER(ctypes.c_long), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+    err = ctypes.c_int(0)
+    mh = lib.mpg123_new(None, ctypes.byref(err))
+    if not mh:
+        raise DecodeError(DTERROR_NOT_AVAILABLE, 'libmpg123 failed')
+    try:
+        lib.mpg123_format_none(mh)
+        for r in (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000):
+            lib.mpg123_format(mh, r, 3, MPG123_ENC_FLOAT_32)   # mono or stereo
+        lib.mpg123_open_feed(mh)
+        lib.mpg123_feed(mh, data, len(data))
+        out = ctypes.create_string_buffer(65536)
+        done = ctypes.c_size_t(0)
+        chunks, total = [], 0
+        rate, ch = ctypes.c_long(0), ctypes.c_int(0)
+        enc = ctypes.c_int(0)
+        for _ in range(10000000):
+            r = lib.mpg123_read(mh, out, len(out), ctypes.byref(done))
+            if r == MPG123_NEW_FORMAT:
+                lib.mpg123_getformat(mh, ctypes.byref(rate), ctypes.byref(ch), ctypes.byref(enc))
+                continue
+            if done.value:
+                chunks.append(out.raw[:done.value])
+                total += done.value
+                if ch.value and total >= max_frames * ch.value * 4:
+                    break
+            if r != MPG123_OK:
+                break
+    finally:
+        lib.mpg123_delete(mh)
+    if not rate.value or not ch.value or not total:
+        raise DecodeError(DTERROR_INVALID_DATA, 'bad MP3 data')
+    return rate.value, ch.value, b''.join(chunks), 'MP3'
+
+
+def resample(samples, rate, out_rate):
+    # One channel of float32 samples to out_rate (libsamplerate)
+    if rate == out_rate:
+        return samples
+    lib = load('samplerate')
+    if not lib:
+        raise DecodeError(DTERROR_NOT_AVAILABLE, 'libsamplerate is not installed')
+
+    class SrcData(ctypes.Structure):
+        _fields_ = [('data_in', ctypes.c_void_p), ('data_out', ctypes.c_void_p),
+                    ('input_frames', ctypes.c_long), ('output_frames', ctypes.c_long),
+                    ('input_frames_used', ctypes.c_long), ('output_frames_gen', ctypes.c_long),
+                    ('end_of_input', ctypes.c_int), ('src_ratio', ctypes.c_double)]
+
+    lib.src_simple.argtypes = [ctypes.POINTER(SrcData), ctypes.c_int, ctypes.c_int]
+    SRC_SINC_MEDIUM_QUALITY = 1
+    n = len(samples) // 4
+    out_n = int(n * out_rate / rate) + 16
+    inbuf = ctypes.create_string_buffer(samples, len(samples))
+    outbuf = ctypes.create_string_buffer(out_n * 4)
+    d = SrcData(ctypes.cast(inbuf, ctypes.c_void_p), ctypes.cast(outbuf, ctypes.c_void_p),
+                n, out_n, 0, 0, 1, out_rate / rate)
+    if lib.src_simple(ctypes.byref(d), SRC_SINC_MEDIUM_QUALITY, 1):
+        raise DecodeError(DTERROR_INVALID_DATA, 'resampling failed')
+    return outbuf.raw[:d.output_frames_gen * 4]
+
+
+def float_to_8bit(samples):
+    # float32 samples to signed 8-bit (through libsamplerate's clipping
+    # conversion to 16-bit, then the high bytes)
+    lib = load('samplerate')
+    n = len(samples) // 4
+    lib.src_float_to_short_array.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int]
+    shorts = ctypes.create_string_buffer(n * 2)
+    lib.src_float_to_short_array(samples, shorts, n)
+    return shorts.raw[1::2]         # little-endian: the high byte of each
+
+
+def decode_sound(data, rate, channels, maxbytes, clock):
+    # Returns (rate, channels, [bytes for each channel], period, file rate,
+    # seconds, format)
+    fmt = detect_sound(data)
+    if fmt is None:
+        raise DecodeError(DTERROR_UNKNOWN_DATATYPE, 'not a sound this service knows')
+    maxbytes = max(1, min(maxbytes, MAX_SOUND_BYTES))
+    out_rate = max(4000, min(rate, 28000))
+    # Enough of the file for maxbytes (at the highest likely file rate)
+    max_frames = maxbytes * 48000 // out_rate + 4096
+    got = read_sndfile(data, max_frames) if load('sndfile') else None
+    if got is None and fmt == 'MP3':
+        got = read_mp3(data, max_frames)
+    if got is None:
+        raise DecodeError(DTERROR_INVALID_DATA, 'cannot decode this sound')
+    src_rate, ch, pcm, fmt = got
+    import array
+    a = array.array('f')
+    a.frombytes(pcm[:len(pcm) // (4 * ch) * 4 * ch])
+    frames = len(a) // ch
+    if not frames:
+        raise DecodeError(DTERROR_INVALID_DATA, 'no sound data')
+    out_rate = min(out_rate, src_rate)
+    if channels >= 2 and ch >= 2:
+        planes = [a[0::ch], a[1::ch]]
+    elif ch >= 2:
+        left, right = a[0::ch], a[1::ch]
+        planes = [array.array('f', ((l + r) * 0.5 for l, r in zip(left, right)))]
+    else:
+        planes = [a]
+    out = []
+    for plane in planes:
+        res = resample(plane.tobytes(), src_rate, out_rate)
+        out.append(float_to_8bit(res)[:maxbytes])
+    length = min(len(c) for c in out)
+    out = [c[:length] for c in out]
+    period = max(124, clock // out_rate) if clock else 0
+    return out_rate, len(out), out, period, src_rate, frames // src_rate, fmt
+
+
 DECODERS = {'WebP': decode_webp, 'AVIF': decode_heif, 'HEIF': decode_heif,
             'JPEG XL': decode_jxl, 'TIFF': decode_tiff}
 
@@ -482,6 +684,24 @@ def decode_all(data, maxw, maxh, mode, colours, bufsize):
     return w, h, src[0], src[1], fmt, palette, pixels
 
 
+def child_sound(data, args, fd):
+    try:
+        rate, ch, chans, period, src_rate, secs, fmt = decode_sound(data, *args)
+        head = struct.pack('=BIIIIII', 2, rate, ch, len(chans[0]), period, src_rate, secs) + fmt.encode().ljust(16)
+        out = [head] + chans
+    except DecodeError as e:
+        out = [struct.pack('=BI', 1, e.code) + str(e).encode('latin-1', 'replace')[:200]]
+    except MemoryError:
+        out = [struct.pack('=BI', 1, ERROR_NO_FREE_STORE) + b'not enough memory on the Pi']
+    except Exception as e:
+        out = [struct.pack('=BI', 1, DTERROR_INVALID_DATA) + ('cannot decode: %s' % e).encode('latin-1', 'replace')[:200]]
+    for part in out:
+        view = memoryview(part)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+
+
 def child(data, args, fd, close_fds):
     # The child process: limits, decoding, the result into the pipe
     for f in close_fds:
@@ -491,6 +711,9 @@ def child(data, args, fd, close_fds):
             pass
     resource.setrlimit(resource.RLIMIT_DATA, (CHILD_MEM, CHILD_MEM))
     resource.setrlimit(resource.RLIMIT_CPU, (DECODE_SECONDS, DECODE_SECONDS + 5))
+    if args[0] == 'sound':
+        child_sound(data, args[1:], fd)
+        return
     try:
         w, h, fw, fh, fmt, palette, pixels = decode_all(data, *args)
         head = struct.pack('=BIIIII', 0, w, h, fw, fh, len(palette or b'')) + fmt.encode().ljust(16)
@@ -529,7 +752,9 @@ class Job(object):
         self.result = bytearray()
         self.deadline = 0
         self.mode = 'rgb'
-        self.waiting = None         # a DECODE waiting for a free child
+        self.waiting = None         # a DECODE or SOUND waiting for a free child
+        self.sound = None           # [bytes for each channel] of a sound
+        self.pos = (0, 0)           # (channel, offset) of the next PCM
 
     def send(self, line):
         self.service.send(self.stream_id, line.encode('latin-1')[:MAX_LINE])
@@ -556,7 +781,10 @@ class Job(object):
         elif cmd == 'DECODE' and len(args) >= 3 and isinstance(args[0], int) and isinstance(args[1], int) \
                 and self.buf and self.pid is None:
             colours = args[3] if len(args) > 3 and isinstance(args[3], int) else 256
-            self.waiting = (max(16, args[0]), max(16, args[1]), args[2], colours)
+            self.waiting = ('picture', max(16, args[0]), max(16, args[1]), args[2], colours)
+            self.service.start_waiting()
+        elif cmd == 'SOUND' and len(args) == 4 and nums and self.buf and self.pid is None:
+            self.waiting = ('sound', args[0], max(1, min(2, args[1])), args[2], args[3])
             self.service.start_waiting()
         elif cmd == 'NEXT' and self.pid is None and self.waiting is None:
             self.next_block()
@@ -564,9 +792,13 @@ class Job(object):
             logger.warning('Unexpected command %r', line[:40])
 
     def start_decode(self):
-        maxw, maxh, mode, colours = self.waiting
+        if self.waiting[0] == 'sound':
+            args = self.waiting
+        else:
+            _, maxw, maxh, mode, colours = self.waiting
+            self.mode = 'pal' if mode == 'pal' else 'rgb'
+            args = (maxw, maxh, self.mode, colours, self.buf[1])
         self.waiting = None
-        self.mode = 'pal' if mode == 'pal' else 'rgb'
         data = self.data
         self.data = bytearray()
         # The child closes what it doesn't need of the parent's: the a314d
@@ -578,7 +810,7 @@ class Job(object):
         if pid == 0:
             os.close(r)
             try:
-                child(bytes(data), (maxw, maxh, self.mode, colours, self.buf[1]), w, others)
+                child(bytes(data), args, w, others)
             finally:
                 os._exit(0)
         os.close(w)
@@ -613,6 +845,17 @@ class Job(object):
             self.send('ERR %d decoding took too long' % DTERROR_INVALID_DATA)
         elif r[:1] == b'\1' and len(r) >= 5:
             self.send('ERR %d %s' % (struct.unpack_from('=I', r, 1)[0], bytes(r[5:]).decode('latin-1')))
+        elif r[:1] == b'\2' and len(r) >= 41:
+            rate, ch, length, period, src_rate, secs = struct.unpack_from('=IIIIII', r, 1)
+            fmt = bytes(r[25:41]).rstrip(b' ').decode()
+            data = memoryview(r)[41:]
+            if not 1 <= ch <= 2 or len(data) != ch * length or not length:
+                self.send('ERR %d bad decoder result' % DTERROR_INVALID_DATA)
+                return
+            self.sound = [data[i * length:(i + 1) * length] for i in range(ch)]
+            self.pos = (0, 0)
+            logger.info('%s %d Hz, %d s, sent as %d channel(s) at %d Hz', fmt, src_rate, secs, ch, rate)
+            self.send('SINFO %d %d %d %d %d %d %s' % (rate, ch, length, period, src_rate, secs, fmt))
         elif r[:1] == b'\0' and len(r) >= 37:
             w, h, fw, fh, plen = struct.unpack_from('=IIIII', r, 1)
             fmt = bytes(r[21:37]).rstrip(b' ').decode()
@@ -632,6 +875,18 @@ class Job(object):
             self.send('ERR %d the picture could not be decoded' % DTERROR_INVALID_DATA)
 
     def next_block(self):
+        if self.sound is not None and self.buf:
+            ch, off = self.pos
+            if ch >= len(self.sound):
+                self.sound = None
+                self.send('DONE')
+                return
+            data = self.sound[ch]
+            n = min(self.buf[1], len(data) - off)
+            self.service.write_mem(self.buf[0], bytes(data[off:off + n]))
+            self.send('PCM %d %d %d' % (ch, off, n))
+            self.pos = (ch, off + n) if off + n < len(data) else (ch + 1, 0)
+            return
         if self.pixels is None or not self.buf:
             self.send('DONE')
             return
@@ -675,7 +930,7 @@ class PictureService(object):
         self.jobs = {}
         self.pending = []
         # Loaded once here, so that every child has them already
-        for name in ('webp', 'webpdemux', 'heif', 'jxl', 'tiff'):
+        for name in ('webp', 'webpdemux', 'heif', 'jxl', 'tiff', 'sndfile', 'mpg123', 'samplerate'):
             load(name)
 
     def start_waiting(self):

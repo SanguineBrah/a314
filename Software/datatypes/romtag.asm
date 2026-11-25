@@ -1,4 +1,5 @@
-; Resident tag for a314picture.datatype
+; Resident tag for the A314 datatypes (a314picture.datatype and
+; a314sound.datatype); each library has its own names and tables
 
 RTC_MATCHWORD:  equ    $4afc
 RTF_AUTOINIT:   equ    (1<<7)

@@ -7,8 +7,8 @@
  * datatypes (MultiView and many others) can show these formats. The
  * descriptors in DEVS:DataTypes recognise the files and name this class.
  *
- * When an object is made, the file is sent to the picture service on the
- * Pi (picture.py) through a buffer in A314 memory; the Pi decodes it and
+ * When an object is made, the file is sent to the datatypes service on the
+ * Pi (datatypes.py) through a buffer in A314 memory; the Pi decodes it and
  * sends the pixels back the same way. With picture.datatype V43 or later
  * (Workbench 3.5, 3.9, 3.2) they are 24-bit, and picture.datatype fits
  * them to the screen; with an older one (3.0, 3.1) the Pi reduces them to
@@ -46,6 +46,7 @@
 
 #include "../a314device/a314.h"
 #include "../a314device/proto_a314.h"
+#include "a314dt.h"
 
 #define SysBase (*(struct ExecBase **)4)
 
@@ -56,16 +57,11 @@ struct Library *DataTypesBase;
 struct Library *A314Base;
 
 #define CLASS_NAME	"a314picture.datatype"
-#define SERVICE_NAME	"picture"
 
-#define BUF_SIZE	32768		/* A314 buffer, for the file and pixels */
 #define DEFAULT_W	1280
 #define DEFAULT_H	1024
 #define DEFAULT_W_V40	640		/* smaller for 3.0/3.1: chip RAM bitmap */
 #define DEFAULT_H_V40	512
-#define MAX_FILE	(64 * 1024 * 1024)	/* as picture.py */
-#define WAIT_SECONDS	20
-#define DECODE_SECONDS	60		/* large pictures take a while */
 
 struct ClassBase
 {
@@ -79,261 +75,6 @@ struct ClassBase
 
 const char library_name[] = CLASS_NAME;
 const char id_string[] = CLASS_NAME " 1.0 (25.11.2026)";
-static const char service_name[] = SERVICE_NAME;
-
-/* ---------------------------------------------------------------------- */
-/* Helpers (there is no C library)                                        */
-
-/* Calls a BOOPSI dispatcher hook (a0 hook, a2 object, a1 message), as
-   amiga.lib's DoSuperMethodA() and CoerceMethodA() do; the amiga.lib for
-   Kickstart 1.3 doesn't have them. */
-ULONG call_hook(__reg("a0") struct Hook *hook, __reg("a2") Object *obj, __reg("a1") Msg msg) =
-	"\tmove.l\ta3,-(a7)\n\tmove.l\t8(a0),a3\n\tjsr\t(a3)\n\tmove.l\t(a7)+,a3";
-
-static ULONG DoSuperMethodA(struct IClass *cl, Object *obj, Msg msg)
-{
-	return call_hook(&cl->cl_Super->cl_Dispatcher, obj, msg);
-}
-
-static ULONG CoerceMethodA(struct IClass *cl, Object *obj, Msg msg)
-{
-	return call_hook(&cl->cl_Dispatcher, obj, msg);
-}
-
-static ULONG str_len(const char *s)
-{
-	const char *p = s;
-	while (*p)
-		p++;
-	return p - s;
-}
-
-static char *put_str(char *dst, const char *s)
-{
-	while (*s)
-		*dst++ = *s++;
-	return dst;
-}
-
-/* Without division, which on the 68000 would need the C library */
-static char *put_num(char *dst, ULONG n)
-{
-	static const ULONG powers[] = { 1000000000, 100000000, 10000000, 1000000,
-		100000, 10000, 1000, 100, 10, 1 };
-	BOOL started = FALSE;
-	int i;
-	for (i = 0; i < 10; i++)
-	{
-		char digit = '0';
-		while (n >= powers[i])
-		{
-			n -= powers[i];
-			digit++;
-		}
-		if (digit != '0' || started || i == 9)
-		{
-			*dst++ = digit;
-			started = TRUE;
-		}
-	}
-	return dst;
-}
-
-/* Reads a number and moves past it and the spaces after it */
-static ULONG get_num(const char **pp)
-{
-	const char *p = *pp;
-	ULONG n = 0;
-	int digits = 0;
-	while (*p >= '0' && *p <= '9')
-	{
-		/* At most 9 digits; more makes a number too large to be valid */
-		if (++digits > 9)
-			n = 0x7fffffff;
-		else
-			n = (n << 3) + (n << 1) + (*p - '0');
-		p++;
-	}
-	while (*p == ' ')
-		p++;
-	*pp = p;
-	return n;
-}
-
-static BOOL starts_with(const char *p, const char *word, const char **rest)
-{
-	while (*word)
-		if (*p++ != *word++)
-			return FALSE;
-	if (*p != ' ' && *p != '\0')
-		return FALSE;
-	while (*p == ' ')
-		p++;
-	*rest = p;
-	return TRUE;
-}
-
-/* ---------------------------------------------------------------------- */
-/* A connection to the picture service, used from the caller's task       */
-
-struct Conn
-{
-	struct MsgPort *port;
-	struct A314_IORequest *read, *write, *reset;
-	struct timerequest *timer;
-	ULONG socket;
-	BOOL connected, read_pending, write_pending, timer_open;
-	BOOL timed_out;			/* the Pi didn't answer something in time */
-	UBYTE in[256];
-	char line[256];
-	UBYTE out[64];
-};
-
-static void a314_cmd(struct Conn *c, struct A314_IORequest *ior, UWORD cmd, UBYTE *buf, WORD len)
-{
-	ior->a314_Request.io_Command = cmd;
-	ior->a314_Request.io_Error = 0;
-	ior->a314_Socket = c->socket;
-	ior->a314_Buffer = (STRPTR)buf;
-	ior->a314_Length = len;
-	SendIO((struct IORequest *)ior);
-}
-
-/* Waits for ior, for up to secs seconds; FALSE on a time-out (ior is
-   then still pending) */
-static BOOL wait_io(struct Conn *c, struct IORequest *ior, ULONG secs)
-{
-	c->timer->tr_node.io_Command = TR_ADDREQUEST;
-	c->timer->tr_time.tv_secs = secs;
-	c->timer->tr_time.tv_micro = 0;
-	SendIO((struct IORequest *)c->timer);
-	for (;;)
-	{
-		if (CheckIO(ior))
-		{
-			WaitIO(ior);
-			AbortIO((struct IORequest *)c->timer);
-			WaitIO((struct IORequest *)c->timer);
-			return TRUE;
-		}
-		if (CheckIO((struct IORequest *)c->timer))
-		{
-			WaitIO((struct IORequest *)c->timer);
-			return FALSE;
-		}
-		Wait(1UL << c->port->mp_SigBit);
-	}
-}
-
-static void start_read(struct Conn *c)
-{
-	a314_cmd(c, c->read, A314_READ, c->in, sizeof(c->in) - 1);
-	c->read_pending = TRUE;
-}
-
-static BOOL conn_open(struct ClassBase *base, struct Conn *c)
-{
-	struct timeval tv;
-
-	c->port = CreateMsgPort();
-	if (!c->port)
-		return FALSE;
-	c->read = (struct A314_IORequest *)CreateIORequest(c->port, sizeof(struct A314_IORequest));
-	c->write = (struct A314_IORequest *)CreateIORequest(c->port, sizeof(struct A314_IORequest));
-	c->reset = (struct A314_IORequest *)CreateIORequest(c->port, sizeof(struct A314_IORequest));
-	c->timer = (struct timerequest *)CreateIORequest(c->port, sizeof(struct timerequest));
-	if (!c->read || !c->write || !c->reset || !c->timer)
-		return FALSE;
-	if (OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)c->timer, 0))
-		return FALSE;
-	c->timer_open = TRUE;
-
-	/* The same open a314.device, through requests of our own */
-	c->read->a314_Request.io_Device = base->a314_ior.a314_Request.io_Device;
-	c->read->a314_Request.io_Unit = base->a314_ior.a314_Request.io_Unit;
-	c->write->a314_Request.io_Device = c->reset->a314_Request.io_Device = c->read->a314_Request.io_Device;
-	c->write->a314_Request.io_Unit = c->reset->a314_Request.io_Unit = c->read->a314_Request.io_Unit;
-
-	/* A socket number of our own: the request's address and the time */
-	c->timer->tr_node.io_Command = TR_GETSYSTIME;
-	DoIO((struct IORequest *)c->timer);
-	tv = c->timer->tr_time;
-	c->socket = (ULONG)c->read ^ (tv.tv_micro << 8) ^ tv.tv_secs;
-
-	a314_cmd(c, c->read, A314_CONNECT, (UBYTE *)service_name, sizeof(service_name) - 1);
-	if (!wait_io(c, (struct IORequest *)c->read, WAIT_SECONDS))
-	{
-		a314_cmd(c, c->reset, A314_RESET, NULL, 0);
-		WaitIO((struct IORequest *)c->reset);
-		WaitIO((struct IORequest *)c->read);
-		return FALSE;
-	}
-	if (c->read->a314_Request.io_Error != A314_CONNECT_OK)
-		return FALSE;
-	c->connected = TRUE;
-	start_read(c);
-	return TRUE;
-}
-
-/* Returns FALSE if the Pi didn't answer something in time */
-static BOOL conn_close(struct Conn *c)
-{
-	if (c->connected)
-	{
-		a314_cmd(c, c->reset, A314_RESET, NULL, 0);
-		WaitIO((struct IORequest *)c->reset);
-		if (c->read_pending)
-			WaitIO((struct IORequest *)c->read);
-		if (c->write_pending)
-			WaitIO((struct IORequest *)c->write);
-	}
-	if (c->timer_open)
-		CloseDevice((struct IORequest *)c->timer);
-	if (c->timer)
-		DeleteIORequest((struct IORequest *)c->timer);
-	if (c->reset)
-		DeleteIORequest((struct IORequest *)c->reset);
-	if (c->write)
-		DeleteIORequest((struct IORequest *)c->write);
-	if (c->read)
-		DeleteIORequest((struct IORequest *)c->read);
-	if (c->port)
-		DeleteMsgPort(c->port);
-	return !c->timed_out;
-}
-
-static BOOL send_line(struct Conn *c, char *end)
-{
-	a314_cmd(c, c->write, A314_WRITE, c->out, end - (char *)c->out);
-	if (!wait_io(c, (struct IORequest *)c->write, WAIT_SECONDS))
-	{
-		c->write_pending = TRUE;	/* conn_close() waits for it */
-		c->timed_out = TRUE;
-		return FALSE;
-	}
-	return c->write->a314_Request.io_Error == A314_WRITE_OK;
-}
-
-/* The next line from the Pi, in c->line; NULL on an error or time-out */
-static const char *get_line(struct Conn *c, ULONG secs)
-{
-	ULONG n;
-	if (!c->read_pending)
-		return NULL;
-	if (!wait_io(c, (struct IORequest *)c->read, secs))
-	{
-		c->timed_out = TRUE;
-		return NULL;
-	}
-	c->read_pending = FALSE;
-	if (c->read->a314_Request.io_Error != A314_READ_OK)
-		return NULL;
-	n = c->read->a314_Length;
-	CopyMem(c->in, c->line, n);
-	c->line[n] = '\0';
-	start_read(c);
-	return c->line;
-}
 
 /* ---------------------------------------------------------------------- */
 /* Loading                                                                */
@@ -405,89 +146,32 @@ static void chunky_to_planar(struct BitMap *bm, UBYTE *src, ULONG y, ULONG rows,
 /* Loads the picture into obj; returns 0, or an error for IoErr() */
 static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 {
+	struct DtJob *job = NULL;
 	struct Conn *c;
 	struct BitMapHeader *bmh = NULL;
 	struct BitMap *bm = NULL;
-	ULONG source = 0, maxw, maxh, w, h, size, sent;
+	ULONG source = 0, maxw, maxh, w, h, a314buf;
 	BPTR fh = 0;
-	ULONG a314buf = INVALID_A314_ADDRESS;
-	UBYTE *tmp = NULL;
+	UBYTE *tmp;
 	BOOL v43 = base->super_base->lib_Version >= 43;
 	const char *p;
 	char *q;
-	LONG err = DTERROR_INVALID_DATA;
-	BOOL buf_given = FALSE;	/* the Pi knows the buffer's address */
+	LONG err;
 	ULONG i, bpp = v43 ? 3 : 1;
-
-	/* Not on the caller's stack, which may be small */
-	c = AllocVec(sizeof(struct Conn), MEMF_PUBLIC | MEMF_CLEAR);
-	if (!c)
-		return ERROR_NO_FREE_STORE;
 
 	get_attrs(obj, DTA_SourceType, (ULONG)&source, DTA_Handle, (ULONG)&fh,
 		PDTA_BitMapHeader, (ULONG)&bmh, TAG_DONE);
 	if (source != DTST_FILE || !fh || !bmh)
-	{
-		FreeVec(c);
 		return ERROR_OBJECT_WRONG_TYPE;
-	}
 
-	Seek(fh, 0, OFFSET_END);
-	size = Seek(fh, 0, OFFSET_BEGINNING);
-	if ((LONG)size <= 0)
-	{
-		FreeVec(c);
-		return DTERROR_NOT_ENOUGH_DATA;
-	}
-	if (size > MAX_FILE)
-	{
-		FreeVec(c);
-		return ERROR_NO_FREE_STORE;
-	}
-
-	tmp = AllocVec(BUF_SIZE, MEMF_PUBLIC);
-	a314buf = AllocMemA314(BUF_SIZE);
-	if (!tmp || a314buf == INVALID_A314_ADDRESS)
-	{
-		err = ERROR_NO_FREE_STORE;
+	/* The file, to the Pi */
+	err = dt_start(&job, &base->a314_ior.a314_Request, fh);
+	if (err)
 		goto out;
-	}
-	if (!conn_open(base, c))
-	{
-		err = DTERROR_NOT_AVAILABLE;	/* no Pi, or no picture service */
-		goto out;
-	}
-
-	/* The file */
-	q = put_num(put_str((char *)c->out, "BUF "), a314buf);
-	*q++ = ' ';
-	buf_given = TRUE;
-	if (!send_line(c, put_num(q, BUF_SIZE)) ||
-		!send_line(c, put_num(put_str((char *)c->out, "FILE "), size)))
-		goto out;
-	for (sent = 0; sent < size; )
-	{
-		LONG n = Read(fh, tmp, BUF_SIZE);
-		if (n <= 0)
-		{
-			err = IoErr() ? IoErr() : DTERROR_NOT_ENOUGH_DATA;
-			goto out;
-		}
-		WriteMemA314(a314buf, tmp, n);
-		if (!send_line(c, put_num(put_str((char *)c->out, "DATA "), n)) ||
-			!(p = get_line(c, WAIT_SECONDS)))
-			goto out;
-		if (starts_with(p, "ERR", &p))
-		{
-			err = get_num(&p);
-			if (!err)
-				err = DTERROR_INVALID_DATA;
-			goto out;
-		}
-		if (!starts_with(p, "TAKEN", &p))
-			goto out;
-		sent += n;
-	}
+	c = &job->conn;
+	tmp = job->tmp;
+	a314buf = job->a314buf;
+	err = DTERROR_INVALID_DATA;
 
 	/* Decoding */
 	wanted_size(&maxw, &maxh, v43);
@@ -499,9 +183,7 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 		goto out;
 	if (starts_with(p, "ERR", &p))
 	{
-		err = get_num(&p);
-		if (!err)
-			err = DTERROR_INVALID_DATA;
+		err = err_code(p);
 		goto out;
 	}
 	if (!starts_with(p, "INFO", &p))
@@ -589,7 +271,7 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 				m.pbpa_Width = w;
 				m.pbpa_Height = n;
 				/* No return value is documented for this method */
-				DoSuperMethodA(cl, obj, (Msg)&m);
+				do_super_method(cl, obj, (Msg)&m);
 			}
 			else
 				chunky_to_planar(bm, tmp, y, n, w);
@@ -609,16 +291,7 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 out:
 	if (bm)
 		FreeBitMap(bm);
-	/* After a time-out the Pi may still write into the buffer (a request
-	   it hadn't answered yet), so then it is left allocated: 32 KB lost,
-	   rather than other memory overwritten. */
-	if (!conn_close(c) && buf_given)
-		a314buf = INVALID_A314_ADDRESS;
-	if (a314buf != INVALID_A314_ADDRESS)
-		FreeMemA314(a314buf, BUF_SIZE);
-	if (tmp)
-		FreeVec(tmp);
-	FreeVec(c);
+	dt_end(job);
 	return err;
 }
 
@@ -631,21 +304,21 @@ static ULONG dispatcher(__reg("a0") struct IClass *cl, __reg("a2") Object *o, __
 
 	if (msg->MethodID == OM_NEW)
 	{
-		Object *obj = (Object *)DoSuperMethodA(cl, o, msg);
+		Object *obj = (Object *)do_super_method(cl, o, msg);
 		if (obj)
 		{
 			LONG err = load(base, cl, obj);
 			if (err)
 			{
 				ULONG dispose = OM_DISPOSE;
-				CoerceMethodA(cl, obj, (Msg)&dispose);
+				coerce_method(cl, obj, (Msg)&dispose);
 				SetIoErr(err);
 				obj = NULL;
 			}
 		}
 		return (ULONG)obj;
 	}
-	return DoSuperMethodA(cl, o, msg);
+	return do_super_method(cl, o, msg);
 }
 
 /* ---------------------------------------------------------------------- */
