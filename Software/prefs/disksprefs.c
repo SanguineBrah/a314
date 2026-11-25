@@ -904,19 +904,37 @@ static BOOL choose_file(char *out, BOOL *writable, BOOL writable_choice)
 /* ---------------------------------------------------------------------- */
 /* Actions                                                                */
 
+/* The last part of a path on the Pi */
+static const char *file_part(const char *path)
+{
+	const char *p = strrchr(path, '/');
+	return p ? p + 1 : path;
+}
+
 static BOOL insert(int unit, struct Image_ *img)
 {
-	char cmd[2 * PATH_LEN + 24];
+	char cmd[2 * PATH_LEN + 24], msg[64];
 	int n = sprintf(cmd, "INSERT %d %d ", unit, img->rw ? 1 : 0);
 	to_hex(img->path, cmd + n, sizeof(cmd) - n);
-	return simple_cmd(cmd);
+	if (!simple_cmd(cmd))
+		return FALSE;
+	/* A short message of our own, rather than the Pi's, which names the
+	   whole path */
+	sprintf(msg, "PD%d: now has %.40s%s", unit, file_part(img->path),
+		img->rw ? "" : " (read only)");
+	set_msg(msg);
+	return TRUE;
 }
 
 static BOOL eject(int unit)
 {
 	char cmd[16];
 	sprintf(cmd, "EJECT %d", unit);
-	return simple_cmd(cmd);
+	if (!simple_cmd(cmd))
+		return FALSE;
+	sprintf(cmd, "PD%d: is empty", unit);
+	set_msg(cmd);
+	return TRUE;
 }
 
 static void change_pressed(int row)
@@ -959,6 +977,7 @@ static void eject_pressed(int row)
 			{
 				at_start[row] = FALSE;
 				at_start_changed[row] = TRUE;
+				set_msg("Ejected; Save to start without a disk in it too");
 			}
 		}
 	}
@@ -982,6 +1001,8 @@ static void check_pressed(int row)
 		}
 		at_start[row] = !at_start[row];
 		at_start_changed[row] = TRUE;
+		set_msg(at_start[row] ? "Save to have this disk in the drive at start" :
+			"Save to start without a disk in this drive");
 	}
 	else
 	{
