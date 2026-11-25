@@ -1007,6 +1007,11 @@ static int init_server_socket()
         return -1;
     }
 
+    // So that a314d can be restarted straight away, while connections from
+    // the previous run are still in TIME_WAIT
+    int one = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
     struct sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
@@ -2173,8 +2178,11 @@ int main(int argc, char **argv)
 
     load_config_file(conf_filename.c_str());
 
-    if (init_driver() == 0)
+    // A failure to start is reported in the exit status, so that systemd
+    // shows it
+    int rc = init_driver() == 0 ? 0 : 1;
+    if (rc == 0)
         main_loop();
     shutdown_driver();
-    return 0;
+    return rc;
 }
