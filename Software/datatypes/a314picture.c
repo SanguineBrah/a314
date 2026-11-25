@@ -202,8 +202,13 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 
 	if (v43)
 	{
-		set_attrs(obj, PDTA_SourceMode, PMODE_V43, TAG_DONE);
+		/* picture.datatype V47 makes its pixel buffer from the nominal
+		   size, which must therefore be set with the mode, before the
+		   first PDTM_WRITEPIXELARRAY (see PDTA_ObtainPixelBuffer in its
+		   autodoc). Otherwise the pixels are lost, and the picture is
+		   never laid out. */
 		bmh->bmh_Depth = 24;
+		set_attrs(obj, PDTA_SourceMode, PMODE_V43, DTA_NominalHoriz, w, DTA_NominalVert, h, TAG_DONE);
 	}
 	else
 	{
