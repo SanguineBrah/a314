@@ -184,9 +184,11 @@ class Port(object):
         self.tx = b''               # from the Amiga, not yet written
         self.lines = None
         self.break_until = None     # when the break being sent ends
+        self.break_waiting = 0      # a break to send (microseconds) ...
+        self.break_after = 0        # ... after this much of tx
 
     def send_line(self, text):
-        self.service.send(self.stream_id, b'C' + text.encode('latin-1'))
+        self.service.send(self.stream_id, b'C' + text.encode('latin-1')[:MAX_DATA])
 
     def open_device(self):
         dev = find_ports().get(self.name)
@@ -216,6 +218,7 @@ class Port(object):
             self.release(self.fd)
             self.fd = None
         self.break_until = None
+        self.break_waiting = 0
 
     def open(self, words):
         if self.name is not None or len(words) != 7:
@@ -282,6 +285,7 @@ class Port(object):
         logger.warning('Lost %s', self.name)
         self.close_device()
         self.gone = True
+        self.lines = None           # sent again when the port is back
         self.send_line('GONE')
         self.drop_tx()
 
@@ -289,6 +293,7 @@ class Port(object):
         if self.tx:
             self.send_line('SENT %d' % len(self.tx))
             self.tx = b''
+            self.break_after = 0
 
     def command(self, text):
         words = text.split()
@@ -310,14 +315,11 @@ class Port(object):
             self.credit += int(args[0])
             self.flush_rx()
         elif cmd == 'BREAK' and len(args) == 1 and args[0].isdigit():
-            # tcsendbreak() only knows "about 0.25 s", so the break is
-            # started here and ended by end_break().
-            if self.fd is not None and self.break_until is None:
-                try:
-                    fcntl.ioctl(self.fd, TIOCSBRK)
-                    self.break_until = time.time() + min(int(args[0]), 2000000) / 1000000
-                except OSError:
-                    pass
+            # After the data sent before it, and before the data after it
+            if not self.break_waiting:
+                self.break_waiting = max(1, min(int(args[0]), 2000000))
+                self.break_after = len(self.tx)
+                self.start_break()
         elif cmd == 'CLEAR':
             self.rx = b''
             if self.fd is not None:
@@ -344,15 +346,18 @@ class Port(object):
         if not self.wants_write():
             return
         try:
-            n = os.write(self.fd, self.tx)
+            n = os.write(self.fd, self.tx[:self.break_after] if self.break_waiting else self.tx)
         except BlockingIOError:
             return
         except OSError:
             self.lost()
             return
         self.tx = self.tx[n:]
+        if self.break_waiting:
+            self.break_after -= n
         if n:
             self.send_line('SENT %d' % n)
+        self.start_break()
 
     def read_some(self):
         try:
@@ -379,7 +384,22 @@ class Port(object):
         return self.fd is not None and len(self.rx) < RX_BUFFER
 
     def wants_write(self):
-        return self.fd is not None and bool(self.tx) and self.break_until is None
+        # Nothing is written during a break, nor after the point where a
+        # waiting break goes.
+        return self.fd is not None and bool(self.tx) and self.break_until is None and \
+            not (self.break_waiting and not self.break_after)
+
+    def start_break(self):
+        # tcsendbreak() only knows "about 0.25 s", so the break is started
+        # here and ended by end_break().
+        if not self.break_waiting or self.break_after or self.fd is None or self.break_until is not None:
+            return
+        try:
+            fcntl.ioctl(self.fd, TIOCSBRK)
+            self.break_until = time.time() + self.break_waiting / 1000000
+        except OSError:
+            pass
+        self.break_waiting = 0
 
     def end_break(self):
         if self.break_until is not None and time.time() >= self.break_until:
@@ -388,6 +408,7 @@ class Port(object):
                 fcntl.ioctl(self.fd, TIOCCBRK)
             except OSError:
                 pass
+            self.start_break()      # one that came during this one
 
     def poll(self):
         # Checks the modem lines, and whether an unplugged port is back
