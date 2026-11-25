@@ -411,11 +411,12 @@ def detect_sound(data):
     return None
 
 
-def read_sndfile(data, max_frames):
-    # Returns (rate, channels, frames as float32 bytes, format name)
+def sndfile_blocks(data):
+    # Yields (rate, channels, format), then blocks of float32 samples
+    # (interleaved), or yields nothing if libsndfile can't read the data
     lib = load('sndfile')
     if not lib:
-        raise DecodeError(DTERROR_NOT_AVAILABLE, 'libsndfile is not installed')
+        return
     vp = ctypes.c_void_p
     SFM_READ = 0x10
     lib.sf_open.restype = vp
@@ -432,32 +433,33 @@ def read_sndfile(data, max_frames):
     finally:
         os.unlink(path)
     if not snd:
-        return None
+        return
     try:
         rate, ch = info.samplerate, info.channels
         if not 1000 <= rate <= 384000 or not 1 <= ch <= 16:
             raise DecodeError(DTERROR_INVALID_DATA, 'bad sound format')
-        chunks, total = [], 0
-        block = 65536
+        yield rate, ch, SOUND_FORMATS.get(info.format & 0x0FFF0000, 'sound')
+        block = 16384
         buf = ctypes.create_string_buffer(block * ch * 4)
-        while total < max_frames:
-            n = lib.sf_readf_float(snd, buf, min(block, max_frames - total))
+        while True:
+            n = lib.sf_readf_float(snd, buf, block)
             if n <= 0:
                 break
-            chunks.append(buf.raw[:n * ch * 4])
-            total += n
+            yield buf.raw[:n * ch * 4]
     finally:
         lib.sf_close(snd)
-    return rate, ch, b''.join(chunks), SOUND_FORMATS.get(info.format & 0x0FFF0000, 'sound')
 
 
-def read_mp3(data, max_frames):
-    # MP3 with libmpg123, if libsndfile can't (older libsndfile has no MP3)
+def mpg123_blocks(data):
+    # The same for MP3 with libmpg123, if libsndfile can't (libsndfile
+    # before 1.1 has no MP3)
     lib = load('mpg123')
     if not lib:
         raise DecodeError(DTERROR_NOT_AVAILABLE, 'libmpg123 is not installed')
     vp = ctypes.c_void_p
-    MPG123_ENC_FLOAT_32, MPG123_NEED_MORE, MPG123_NEW_FORMAT, MPG123_OK = 0x200, -10, -11, 0
+    MPG123_ENC_FLOAT_32, MPG123_NEW_FORMAT, MPG123_OK = 0x200, -11, 0
+    if hasattr(lib, 'mpg123_init'):
+        lib.mpg123_init()       # needed before libmpg123 1.27
     lib.mpg123_new.restype = vp
     lib.mpg123_new.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
     lib.mpg123_delete.argtypes = [vp]
@@ -479,104 +481,151 @@ def read_mp3(data, max_frames):
         lib.mpg123_feed(mh, data, len(data))
         out = ctypes.create_string_buffer(65536)
         done = ctypes.c_size_t(0)
-        chunks, total = [], 0
-        rate, ch = ctypes.c_long(0), ctypes.c_int(0)
-        enc = ctypes.c_int(0)
-        for _ in range(10000000):
+        rate, ch, enc = ctypes.c_long(0), ctypes.c_int(0), ctypes.c_int(0)
+        started = False
+        while True:
             r = lib.mpg123_read(mh, out, len(out), ctypes.byref(done))
             if r == MPG123_NEW_FORMAT:
                 lib.mpg123_getformat(mh, ctypes.byref(rate), ctypes.byref(ch), ctypes.byref(enc))
+                if started or not rate.value or ch.value not in (1, 2):
+                    break       # a change of format in the middle: stop there
+                started = True
+                yield rate.value, ch.value, 'MP3'
                 continue
-            if done.value:
-                chunks.append(out.raw[:done.value])
-                total += done.value
-                if ch.value and total >= max_frames * ch.value * 4:
-                    break
+            if done.value and started:
+                yield out.raw[:done.value]
             if r != MPG123_OK:
                 break
     finally:
         lib.mpg123_delete(mh)
-    if not rate.value or not ch.value or not total:
-        raise DecodeError(DTERROR_INVALID_DATA, 'bad MP3 data')
-    return rate.value, ch.value, b''.join(chunks), 'MP3'
 
 
-def resample(samples, rate, out_rate):
-    # One channel of float32 samples to out_rate (libsamplerate)
-    if rate == out_rate:
-        return samples
-    lib = load('samplerate')
-    if not lib:
-        raise DecodeError(DTERROR_NOT_AVAILABLE, 'libsamplerate is not installed')
-
-    class SrcData(ctypes.Structure):
-        _fields_ = [('data_in', ctypes.c_void_p), ('data_out', ctypes.c_void_p),
-                    ('input_frames', ctypes.c_long), ('output_frames', ctypes.c_long),
-                    ('input_frames_used', ctypes.c_long), ('output_frames_gen', ctypes.c_long),
-                    ('end_of_input', ctypes.c_int), ('src_ratio', ctypes.c_double)]
-
-    lib.src_simple.argtypes = [ctypes.POINTER(SrcData), ctypes.c_int, ctypes.c_int]
-    SRC_SINC_MEDIUM_QUALITY = 1
-    n = len(samples) // 4
-    out_n = int(n * out_rate / rate) + 16
-    inbuf = ctypes.create_string_buffer(samples, len(samples))
-    outbuf = ctypes.create_string_buffer(out_n * 4)
-    d = SrcData(ctypes.cast(inbuf, ctypes.c_void_p), ctypes.cast(outbuf, ctypes.c_void_p),
-                n, out_n, 0, 0, 1, out_rate / rate)
-    if lib.src_simple(ctypes.byref(d), SRC_SINC_MEDIUM_QUALITY, 1):
-        raise DecodeError(DTERROR_INVALID_DATA, 'resampling failed')
-    return outbuf.raw[:d.output_frames_gen * 4]
+class SrcData(ctypes.Structure):
+    _fields_ = [('data_in', ctypes.c_void_p), ('data_out', ctypes.c_void_p),
+                ('input_frames', ctypes.c_long), ('output_frames', ctypes.c_long),
+                ('input_frames_used', ctypes.c_long), ('output_frames_gen', ctypes.c_long),
+                ('end_of_input', ctypes.c_int), ('src_ratio', ctypes.c_double)]
 
 
-def float_to_8bit(samples):
-    # float32 samples to signed 8-bit (through libsamplerate's clipping
-    # conversion to 16-bit, then the high bytes)
-    lib = load('samplerate')
-    n = len(samples) // 4
-    lib.src_float_to_short_array.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int]
-    shorts = ctypes.create_string_buffer(n * 2)
-    lib.src_float_to_short_array(samples, shorts, n)
-    return shorts.raw[1::2]         # little-endian: the high byte of each
+class Resampler(object):
+    # Resamples interleaved float32 blocks as they come (libsamplerate),
+    # and turns them into signed 8-bit samples
+
+    def __init__(self, rate, out_rate, channels):
+        lib = load('samplerate')
+        if not lib:
+            raise DecodeError(DTERROR_NOT_AVAILABLE, 'libsamplerate is not installed')
+        lib.src_new.restype = ctypes.c_void_p
+        lib.src_new.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        lib.src_process.argtypes = [ctypes.c_void_p, ctypes.POINTER(SrcData)]
+        lib.src_delete.argtypes = [ctypes.c_void_p]
+        lib.src_float_to_short_array.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int]
+        self.lib = lib
+        self.ratio = out_rate / rate
+        self.ch = channels
+        self.state = None
+        if rate != out_rate:
+            SRC_SINC_FASTEST = 2        # plenty for 8-bit samples
+            err = ctypes.c_int(0)
+            self.state = lib.src_new(SRC_SINC_FASTEST, channels, ctypes.byref(err))
+            if not self.state:
+                raise DecodeError(DTERROR_INVALID_DATA, 'resampling failed')
+
+    def process(self, samples, last=False):
+        # float32 interleaved in, signed 8-bit interleaved out
+        if self.state:
+            n = len(samples) // (4 * self.ch)
+            out_n = int(n * self.ratio) + 64
+            inbuf = ctypes.create_string_buffer(samples, len(samples))
+            outbuf = ctypes.create_string_buffer(out_n * 4 * self.ch)
+            d = SrcData(ctypes.cast(inbuf, ctypes.c_void_p), ctypes.cast(outbuf, ctypes.c_void_p),
+                        n, out_n, 0, 0, int(last), self.ratio)
+            if self.lib.src_process(self.state, ctypes.byref(d)):
+                raise DecodeError(DTERROR_INVALID_DATA, 'resampling failed')
+            samples = outbuf.raw[:d.output_frames_gen * 4 * self.ch]
+        count = len(samples) // 4
+        shorts = ctypes.create_string_buffer(count * 2)
+        self.lib.src_float_to_short_array(samples, shorts, count)
+        return shorts.raw[1::2]         # little-endian: the high byte of each
+
+    def close(self):
+        if self.state:
+            self.lib.src_delete(self.state)
+            self.state = None
 
 
 def decode_sound(data, rate, channels, maxbytes, clock):
     # Returns (rate, channels, [bytes for each channel], period, file rate,
-    # seconds, format)
+    # seconds, format). The file is decoded, resampled and made 8-bit a
+    # block at a time, until maxbytes have been made for each channel, so
+    # that only the result is kept, never the whole file.
+    import array
     fmt = detect_sound(data)
     if fmt is None:
         raise DecodeError(DTERROR_UNKNOWN_DATATYPE, 'not a sound this service knows')
     maxbytes = max(1, min(maxbytes, MAX_SOUND_BYTES))
-    out_rate = max(4000, min(rate, 28000))
-    # Enough of the file for maxbytes (at the highest likely file rate)
-    max_frames = maxbytes * 48000 // out_rate + 4096
-    got = read_sndfile(data, max_frames) if load('sndfile') else None
-    if got is None and fmt == 'MP3':
-        got = read_mp3(data, max_frames)
-    if got is None:
+    blocks = sndfile_blocks(data)
+    head = next(blocks, None)
+    if head is None and fmt == 'MP3':
+        blocks = mpg123_blocks(data)
+        head = next(blocks, None)
+    if head is None:
         raise DecodeError(DTERROR_INVALID_DATA, 'cannot decode this sound')
-    src_rate, ch, pcm, fmt = got
-    import array
-    a = array.array('f')
-    a.frombytes(pcm[:len(pcm) // (4 * ch) * 4 * ch])
-    frames = len(a) // ch
-    if not frames:
-        raise DecodeError(DTERROR_INVALID_DATA, 'no sound data')
-    out_rate = min(out_rate, src_rate)
-    if channels >= 2 and ch >= 2:
-        planes = [a[0::ch], a[1::ch]]
-    elif ch >= 2:
-        left, right = a[0::ch], a[1::ch]
-        planes = [array.array('f', ((l + r) * 0.5 for l, r in zip(left, right)))]
-    else:
-        planes = [a]
-    out = []
-    for plane in planes:
-        res = resample(plane.tobytes(), src_rate, out_rate)
-        out.append(float_to_8bit(res)[:maxbytes])
+    src_rate, ch, fmt = head
+    out_rate = max(4000, min(rate, 28000, src_rate))
+    out_ch = 2 if channels >= 2 and ch >= 2 else 1
+    # Resampled as two channels at most (the first two); mixed to mono
+    # afterwards, at the lower rate, if that is wanted
+    res_ch = min(ch, 2)
+    rs = Resampler(src_rate, out_rate, res_ch)
+    out = [bytearray() for _ in range(out_ch)]
+    frames = 0
+    try:
+        pending = None
+        for block in blocks:
+            if pending is not None:
+                done = convert(rs, pending, ch, res_ch, out_ch, out, maxbytes, False)
+                if done:
+                    break
+            frames += len(block) // (4 * ch)
+            pending = block
+        else:
+            if pending is not None:
+                convert(rs, pending, ch, res_ch, out_ch, out, maxbytes, True)
+    finally:
+        rs.close()
+        blocks.close()
     length = min(len(c) for c in out)
-    out = [c[:length] for c in out]
+    if not length:
+        raise DecodeError(DTERROR_INVALID_DATA, 'no sound data')
+    chans = [bytes(c[:length]) for c in out]
     period = max(124, clock // out_rate) if clock else 0
-    return out_rate, len(out), out, period, src_rate, frames // src_rate, fmt
+    return out_rate, out_ch, chans, period, src_rate, frames // src_rate, fmt
+
+
+def convert(rs, block, ch, res_ch, out_ch, out, maxbytes, last):
+    # One block: to at most two channels, resampled, 8-bit, into out.
+    # Returns True when out is full.
+    import array
+    if ch > 2:
+        a = array.array('f')
+        a.frombytes(block)
+        left, right = a[0::ch], a[1::ch]
+        both = array.array('f', bytes(len(left) * 8))
+        both[0::2], both[1::2] = left, right
+        block = both.tobytes()
+    b8 = rs.process(block, last)
+    if res_ch == 2 and out_ch == 2:
+        parts = [b8[0::2], b8[1::2]]
+    elif res_ch == 2:
+        # Mono from stereo, at the lower rate
+        l, r = b8[0::2], b8[1::2]
+        parts = [bytes((((x ^ 0x80) + (y ^ 0x80)) >> 1) ^ 0x80 for x, y in zip(l, r))]
+    else:
+        parts = [b8]
+    for c, part in zip(out, parts):
+        c += part[:maxbytes - len(c)]
+    return all(len(c) >= maxbytes for c in out)
 
 
 DECODERS = {'WebP': decode_webp, 'AVIF': decode_heif, 'HEIF': decode_heif,

@@ -88,6 +88,9 @@ static LONG load(struct ClassBase *base, Object *obj)
 	ULONG source = 0, maxbytes, rate, channels, length, period, wanted, i;
 	BPTR fh = 0;
 	BOOL v44 = base->super_base->lib_Version >= 44;
+	/* Before V40 (Workbench 3.0) the samples have to be in chip memory */
+	ULONG memtype = base->super_base->lib_Version >= 40 ? MEMF_PUBLIC : MEMF_CHIP;
+	ULONG received = 0;
 	const char *p;
 	char *q;
 	LONG err;
@@ -107,7 +110,7 @@ static LONG load(struct ClassBase *base, Object *obj)
 
 	/* At most half of the largest free block for each channel */
 	wanted = v44 ? 2 : 1;
-	maxbytes = AvailMem(MEMF_PUBLIC | MEMF_LARGEST) >> wanted;	/* shift: no division */
+	maxbytes = AvailMem(memtype | MEMF_LARGEST) >> wanted;	/* shift: no division */
 	if (maxbytes > MAX_CHANNEL)
 		maxbytes = MAX_CHANNEL;
 	if (maxbytes < 1024)
@@ -138,11 +141,16 @@ static LONG load(struct ClassBase *base, Object *obj)
 	if (rate < 1000 || rate > 65535 || channels < 1 || channels > wanted ||
 		length == 0 || length > maxbytes || period < 124 || period > 65535)
 		goto out;
+	/* Before V44 the length has to be even; the last byte isn't played */
+	if (!v44 && (length & 1))
+		length--;
+	if (length == 0)
+		goto out;
 
 	for (i = 0; i < channels; i++)
 	{
 		/* Freed by sound.datatype with FreeVec() (SDTA_FreeSampleData) */
-		samples[i] = AllocVec(length, MEMF_PUBLIC);
+		samples[i] = AllocVec(length + 1, memtype | MEMF_CLEAR);
 		if (!samples[i])
 		{
 			err = ERROR_NO_FREE_STORE;
@@ -162,11 +170,16 @@ static LONG load(struct ClassBase *base, Object *obj)
 		ch = get_num(&p);
 		off = get_num(&p);
 		n = get_num(&p);
-		/* Written so that nothing can overflow */
-		if (ch >= channels || n == 0 || n > BUF_SIZE || n > length || off > length - n)
+		/* Written so that nothing can overflow. A last odd byte (dropped
+		   above before V44) may still come: the buffers have room. */
+		if (ch >= channels || n == 0 || n > BUF_SIZE || n > length + 1 || off > length + 1 - n)
 			goto out;
 		ReadMemA314(samples[ch] + off, job->a314buf, n);
+		received += n;
 	}
+	/* Everything, or the sound would end in whatever was in memory */
+	if (received < channels * length)
+		goto out;
 
 	if (vh)
 	{
