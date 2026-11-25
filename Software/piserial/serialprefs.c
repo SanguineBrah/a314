@@ -202,10 +202,15 @@ static void load_settings(void)
 /* Use: ENV: only. Save: ENV: and the archive. */
 static BOOL store_settings(BOOL save)
 {
+	struct Process *me = (struct Process *)FindTask(NULL);
+	APTR old = me->pr_WindowPtr;
 	const char *arch = archive_dir();
 	BOOL ok = TRUE;
 	int u;
 
+	/* A missing ENV: is reported below, not with an "insert volume"
+	   requester */
+	me->pr_WindowPtr = (APTR)-1;
 	for (u = 0; u < UNITS; u++)
 	{
 		const char *v = choice[u][0] ? choice[u] : "auto";
@@ -213,6 +218,7 @@ static BOOL store_settings(BOOL save)
 		if (save)
 			ok = write_var(arch, u, v) && ok;
 	}
+	me->pr_WindowPtr = old;
 	return ok;
 }
 
