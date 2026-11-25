@@ -251,19 +251,19 @@ class Proc(object):
         return lines[-1].upper()[:60] if lines else 'EXITED UNEXPECTEDLY'
 
     def stop(self):
+        # rtl_fm and rtl_power have nothing to save, and asked politely to
+        # stop, rtl_fm can take a second (blocked writing output nobody
+        # reads), during which the audio stopped and then jumped. Killed,
+        # they are gone at once, and the dongle can be opened again.
+        self.p.stdout.close()
+        self.p.stderr.close()
         if self.p.poll() is None:
-            self.p.terminate()
+            self.p.kill()
             try:
                 self.p.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
-                self.p.kill()
-                try:
-                    self.p.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    # Stuck in USB I/O. The subprocess module reaps it later.
-                    logger.error('Process %d does not exit', self.p.pid)
-        self.p.stdout.close()
-        self.p.stderr.close()
+                # Stuck in USB I/O. The subprocess module reaps it later.
+                logger.error('Process %d does not exit', self.p.pid)
 
 
 def volume_table(vol):
