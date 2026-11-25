@@ -1130,6 +1130,45 @@ void action_set_protect(struct DosPacket *dp)
 	reply_packet(dp);
 }
 
+void action_set_date(struct DosPacket *dp)
+{
+	struct FileLock *lock = (struct FileLock *)BADDR(dp->dp_Arg2);
+	unsigned char *name = (unsigned char *)BADDR(dp->dp_Arg3);
+	struct DateStamp *ds = (struct DateStamp *)dp->dp_Arg4;
+
+	dbg("ACTION_SET_DATE\n");
+	dbg("  lock = $l\n", lock);
+	dbg("  name = $S\n", name);
+
+	struct SetDateRequest *req = (struct SetDateRequest *)request_buffer;
+	req->has_response = 0;
+	req->type = dp->dp_Type;
+	req->key = lock == NULL ? 0 : lock->fl_Key;
+	req->days = ds->ds_Days;
+	req->minute = ds->ds_Minute;
+	req->tick = ds->ds_Tick;
+
+	int nlen = *name;
+	memcpy(req->name, name, nlen + 1);
+
+	write_req_and_wait_for_res(sizeof(struct SetDateRequest) + nlen);
+
+	struct SetDateResponse *res = (struct SetDateResponse *)request_buffer;
+	if (!res->success)
+	{
+		dbg("  Failed, error code $l\n", (LONG)res->error_code);
+		dp->dp_Res1 = DOSFALSE;
+		dp->dp_Res2 = res->error_code;
+	}
+	else
+	{
+		dp->dp_Res1 = DOSTRUE;
+		dp->dp_Res2 = 0;
+	}
+
+	reply_packet(dp);
+}
+
 void action_set_comment(struct DosPacket *dp)
 {
 	struct FileLock *lock = (struct FileLock *)BADDR(dp->dp_Arg2);
@@ -1342,7 +1381,7 @@ void start(__reg("a0") struct DosPacket *startup_packet)
 
 		case ACTION_SET_PROTECT: action_set_protect(dp); break;
 		case ACTION_SET_COMMENT: action_set_comment(dp); break;
-		//case ACTION_SET_DATE: action_set_date(dp); break;
+		case ACTION_SET_DATE: action_set_date(dp); break;
 
 		case ACTION_SAME_LOCK: action_same_lock(dp); break;
 		case ACTION_DISK_INFO: action_disk_info(dp); break;
