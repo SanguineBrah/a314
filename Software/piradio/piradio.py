@@ -68,7 +68,8 @@ MAX_GAINS = 40
 MAX_ACTIVE = 200
 MODES = ('wbfm', 'fm', 'am', 'usb', 'lsb', 'raw')
 
-RETUNE_DELAY = 0.2              # wait for more changes before restarting rtl_fm
+RETUNE_DELAY = 0.5              # quiet time after the last change before
+                                # rtl_fm is started again
 FADE = OUT_RATE // 50           # samples (20 ms) faded out and in when retuning
 RETRY_DELAY = 5.0               # after an error
 SWEEP_TIMEOUT = 30.0
@@ -515,9 +516,13 @@ class Radio(object):
         self.retune_at = time.time() + RETRY_DELAY
 
     def retune(self, now=False):
-        # Restarts rtl_fm soon, so that a burst of changes (a slider being
-        # dragged) only restarts it once.
+        # rtl_fm has to be restarted to tune, which takes about 0.7 s. While
+        # the user is tuning (turning a knob, dragging the dial), the radio
+        # stays quiet, and rtl_fm is started once they have stopped for
+        # RETUNE_DELAY, rather than playing scraps between restarts.
         if self.active and not self.sweep:
+            if not now:
+                self.stop_fm()
             self.retune_at = time.time() + (0 if now else RETUNE_DELAY)
 
     def handle_fm_output(self):
