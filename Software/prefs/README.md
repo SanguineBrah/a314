@@ -27,6 +27,11 @@ that runs the A314 software (for example in `a314shared/adfs` and
 `a314shared/hdfs`). The drives can only be used once PD0: is mounted (see
 the [disk README](../disk/README.md)).
 
+Before a settings file is changed, the old one is copied to
+`~/.config/a314/` on the Pi. A settings file that can't be read (for
+example after a mistake in editing it by hand) is left alone, and the
+tool says so.
+
 ## The a314prefs service
 
 The tools talk to the `a314prefs` service on the Pi

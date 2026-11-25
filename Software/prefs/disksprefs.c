@@ -48,7 +48,7 @@
 #define SCSI_UNITS	4
 #define PATH_LEN	250		/* relative to the Pi user's home */
 #define MAX_FILES	200
-#define NAME_LEN	64
+#define NAME_LEN	120		/* the longest the Pi sends */
 
 /* Main window layout, inside the borders */
 #define INNER_W		600
@@ -120,7 +120,8 @@ static int ox, oy;
 static struct MsgPort *mp = NULL;
 static struct A314_IORequest *cmsg = NULL, *rmsg = NULL, *wmsg = NULL;
 static struct timerequest *treq = NULL;
-static BOOL a314_open = FALSE, timer_open = FALSE, connected = FALSE, read_pending = FALSE;
+static BOOL a314_open = FALSE, timer_open = FALSE, connected = FALSE;
+static BOOL read_pending = FALSE, write_pending = FALSE;
 static ULONG socket;
 static UBYTE arbuf[256];
 static char line[256];
@@ -246,6 +247,9 @@ static BOOL wait_io(struct IORequest *ior, ULONG secs)
 	}
 }
 
+/* Ends the connection. a314.device returns every request of the socket
+   when it is reset, so all of them are collected here, also those whose
+   wait timed out. */
 static void disconnect(void)
 {
 	if (!connected)
@@ -254,7 +258,9 @@ static void disconnect(void)
 	WaitIO((struct IORequest *)cmsg);
 	if (read_pending)
 		WaitIO((struct IORequest *)rmsg);
-	read_pending = FALSE;
+	if (write_pending)
+		WaitIO((struct IORequest *)wmsg);
+	read_pending = write_pending = FALSE;
 	connected = FALSE;
 }
 
@@ -283,10 +289,16 @@ static BOOL send_cmd(const char *text)
 {
 	int n = strlen(text);
 	if (!connected || n > 251)
-		return FALSE;
+		return FALSE;		/* (too long: checked by the callers) */
 	memcpy(awbuf, text, n);
 	a314_cmd(wmsg, A314_WRITE, awbuf, n);
-	if (!wait_io((struct IORequest *)wmsg, 10) || wmsg->a314_Request.io_Error != A314_WRITE_OK)
+	if (!wait_io((struct IORequest *)wmsg, 10))
+	{
+		write_pending = TRUE;	/* collected by disconnect() */
+		disconnect();
+		return FALSE;
+	}
+	if (wmsg->a314_Request.io_Error != A314_WRITE_OK)
 	{
 		disconnect();
 		return FALSE;
@@ -298,8 +310,14 @@ static BOOL send_cmd(const char *text)
 static BOOL next_line(void)
 {
 	int n;
-	if (!read_pending || !wait_io((struct IORequest *)rmsg, 10) ||
-		rmsg->a314_Request.io_Error != A314_READ_OK)
+	if (!read_pending)
+		return FALSE;
+	if (!wait_io((struct IORequest *)rmsg, 10))
+	{
+		disconnect();		/* the read is still pending: collected there */
+		return FALSE;
+	}
+	if (rmsg->a314_Request.io_Error != A314_READ_OK)
 	{
 		read_pending = FALSE;
 		disconnect();
@@ -320,7 +338,17 @@ static void set_msg(const char *s);
 /* Sends a command whose answer is OK or ERR; shows it; TRUE for OK */
 static BOOL simple_cmd(const char *text)
 {
-	if (!connect_pi() || !send_cmd(text) || !next_line())
+	int tries;
+	BOOL ok = FALSE;
+	if (strlen(text) > 251)
+	{
+		set_msg("The path is too long");
+		return FALSE;
+	}
+	/* Twice, in case the Pi service was restarted since the last command */
+	for (tries = 0; tries < 2 && !ok; tries++)
+		ok = connect_pi() && send_cmd(text) && next_line();
+	if (!ok)
 	{
 		set_msg("No answer from the Pi");
 		return FALSE;
@@ -411,7 +439,12 @@ static BOOL list_files(const char *dir)
 	strcpy(cmd, "FILES ");
 	to_hex(dir, cmd + 6, sizeof(cmd) - 6);
 	nfiles = 0;
-	if (!connect_pi() || !send_cmd(cmd))
+	if (strlen(cmd) > 251)
+	{
+		set_msg("The path is too long");
+		return FALSE;
+	}
+	if (!(connect_pi() && send_cmd(cmd)) && !(connect_pi() && send_cmd(cmd)))
 		return FALSE;
 	for (;;)
 	{
@@ -620,7 +653,7 @@ static struct Border fb_border = { 0, 0, 1, 0, JAM1, 5, fb_xy, NULL };
 static void fb_draw_list(void)
 {
 	int i;
-	char text[FB_LIST_W / 8 + 1], dir[FB_LIST_W / 8 + 1];
+	char text[NAME_LEN + 16], dir[FB_LIST_W / 8 + 1];
 
 	clear(frp, fox + 8, foy + 6, FB_W - 16, 8);
 	SetAPen(frp, 1);
@@ -642,7 +675,7 @@ static void fb_draw_list(void)
 		}
 		SetAPen(frp, n == fb_selected ? 2 : 1);
 		if (files[n].dir)
-			sprintf(text, "%s/", files[n].name);
+			sprintf(text, "%.60s/", files[n].name);
 		else
 			sprintf(text, "%-40.40s %5luK", files[n].name, files[n].size >> 10);
 		print_at(frp, fox + FB_LIST_X + 4, y + 1, text, FB_LIST_W / 8 - 1);
@@ -799,10 +832,15 @@ static BOOL choose_file(char *out, BOOL *writable, BOOL writable_choice)
 					if (files[n].dir)
 					{
 						char dir[PATH_LEN + 1];
-						if (fb_dir[0] && strlen(fb_dir) + strlen(files[n].name) + 1 < PATH_LEN)
+						if (!fb_dir[0])
+							strcpy(dir, files[n].name);
+						else if (strlen(fb_dir) + strlen(files[n].name) + 1 < PATH_LEN)
 							sprintf(dir, "%s/%s", fb_dir, files[n].name);
 						else
-							strcpy(dir, files[n].name);
+						{
+							set_msg("The path is too long");
+							continue;
+						}
 						fb_enter(dir);
 					}
 					else
@@ -835,10 +873,15 @@ static BOOL choose_file(char *out, BOOL *writable, BOOL writable_choice)
 				case GID_FB_OK:
 					if (fb_selected >= 0 && fb_selected < nfiles)
 					{
-						if (fb_dir[0] && strlen(fb_dir) + strlen(files[fb_selected].name) + 1 <= PATH_LEN)
+						if (!fb_dir[0])
+							strcpy(out, files[fb_selected].name);
+						else if (strlen(fb_dir) + strlen(files[fb_selected].name) + 1 <= PATH_LEN)
 							sprintf(out, "%s/%s", fb_dir, files[fb_selected].name);
 						else
-							strcpy(out, files[fb_selected].name);
+						{
+							set_msg("The path is too long");
+							break;
+						}
 						*writable = fb_writable;
 						chosen = done = TRUE;
 					}
@@ -852,6 +895,9 @@ static BOOL choose_file(char *out, BOOL *writable, BOOL writable_choice)
 	}
 	CloseWindow(fbw);
 	fbw = NULL;
+	/* Clicks on the main window while the browser was open are dropped */
+	while ((im = (struct IntuiMessage *)GetMsg(win->UserPort)) != NULL)
+		ReplyMsg((struct Message *)im);
 	return chosen;
 }
 
@@ -960,6 +1006,9 @@ static BOOL save_settings(void)
 		to_hex(at_start[i] ? drives[i].path : "", cmd + n, sizeof(cmd) - n);
 		ok = simple_cmd(cmd) && ok;
 	}
+	if (scsi_changed[0] && !confirm("Hard disk unit 0 is usually the disk the",
+		"Amiga starts from. Change it?"))
+		return FALSE;
 	for (i = 0; i < SCSI_UNITS; i++)
 	{
 		if (!scsi_changed[i])
@@ -1136,7 +1185,9 @@ int main(void)
 	}
 	if (!connect_pi())
 	{
-		report("The a314prefs service is not installed on the Pi");
+		report(cmsg->a314_Request.io_Error == A314_CONNECT_UNKNOWN_SERVICE ?
+			"The a314prefs service is not installed on the Pi" :
+			"No answer from the Pi");
 		rc = 20;
 		goto cleanup;
 	}

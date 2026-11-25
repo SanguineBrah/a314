@@ -104,24 +104,55 @@ def disk_control(command):
         return None
 
 
+class ConfigError(Exception):
+    pass
+
+
 def read_json(path):
+    # {} if there is no file; ConfigError if there is one that can't be
+    # read, so that it is never replaced by one that has lost its contents
     try:
         with open(path) as f:
             j = json.load(f)
-        return j if isinstance(j, dict) else {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as e:
+        raise ConfigError('%s can\'t be read (%s)' % (path, e))
+    if not isinstance(j, dict):
+        raise ConfigError('%s is not as expected' % path)
+    return j
+
+
+def entries(j, key):
+    # The list of dicts under key (anything else in it is left out)
+    v = j.get(key, [])
+    return [e for e in v if isinstance(e, dict)] if isinstance(v, list) else []
 
 
 def write_json(path, j):
     # Written in place: the directory (/etc/opt/a314) isn't writable, only
-    # the file. One write of a small file.
+    # the file. A copy of the old file is kept in ~/.config/a314, and the new
+    # text is padded with spaces to the old length before the file is made
+    # shorter, so that if the power goes in between the file is still valid
+    # JSON.
     data = json.dumps(j, indent=4) + '\n'
-    with open(path, 'r+' if os.path.exists(path) else 'w') as f:
-        f.write(data)
-        f.truncate()
+    old = b''
+    if os.path.exists(path):
+        with open(path, 'rb') as f:
+            old = f.read()
+        backup = os.path.join(HOME, '.config', 'a314')
+        os.makedirs(backup, exist_ok=True)
+        with open(os.path.join(backup, os.path.basename(path) + '.bak'), 'wb') as f:
+            f.write(old)
+    new = data.encode()
+    with open(path, 'r+b' if old else 'wb') as f:
+        f.write(new + b' ' * max(0, len(old) - len(new)))
         f.flush()
         os.fsync(f.fileno())
+        if len(old) > len(new):
+            f.truncate(len(new))
+            f.flush()
+            os.fsync(f.fileno())
 
 
 class Session(object):
@@ -148,16 +179,56 @@ class Session(object):
                 handler(args)
         except (ValueError, IndexError):
             self.send('ERR bad command')
+        except ConfigError as e:
+            self.send('ERR %s' % e)
         except OSError as e:
             self.send('ERR %s' % (e.strerror or e))
+        except Exception as e:
+            # Never the service: an odd config or command fails on its own
+            logger.warning('%r failed: %s', line[:40], e)
+            self.send('ERR %s' % e)
 
     def image_arg(self, word):
-        # A file name from the Amiga: inside the home directory, an image
+        # A file name from the Amiga: an image inside the home directory, or
+        # one already in use (in a drive or a config), wherever it is, so
+        # that Cancel can put it back and its settings can be changed
         rel = from_hex(word)
         path = inside_home(rel)
-        if path is None or not os.path.isfile(path) or not path.lower().endswith(IMAGE_EXTS):
+        if path is None:
+            if os.path.isabs(rel) and os.path.realpath(rel) in self.images_in_use():
+                path = os.path.realpath(rel)
+            else:
+                return None
+        if not os.path.isfile(path) or not path.lower().endswith(IMAGE_EXTS):
             return None
         return path
+
+    def images_in_use(self):
+        used = set()
+        for key, conf in (('auto-insert', DISK_CONF), ('units', SCSI_CONF)):
+            try:
+                for e in entries(read_json(conf), key):
+                    if isinstance(e.get('filename'), str) and e['filename']:
+                        used.add(os.path.realpath(e['filename']))
+            except ConfigError:
+                pass
+        for unit, (rw, name) in self.drive_status().items():
+            if name:
+                used.add(os.path.realpath(name))
+        return used
+
+    def drive_status(self):
+        # {unit: (rw, file)} from the disk service, or None if it isn't
+        # running (or is too old to answer "status")
+        status = disk_control('status')
+        if status is None or not status[:1].isdigit():
+            return None if status is None or 'Unknown' in status else {}
+        now = {}
+        for line in status.splitlines():
+            parts = line.split(' ', 2)
+            if len(parts) >= 2 and parts[0].isdigit():
+                now[int(parts[0])] = (parts[1], parts[2] if len(parts) > 2 else '')
+        return now
 
     def unit_arg(self, word, count):
         unit = int(word)
@@ -171,8 +242,8 @@ class Session(object):
         if path is None or not os.path.isdir(path):
             self.send('ERR no such directory')
             return
-        entries = []
-        for name in sorted(os.listdir(path), key=str.lower)[:MAX_FILES * 4]:
+        found = []
+        for name in sorted(os.listdir(path), key=str.lower):
             if name.startswith('.'):
                 continue
             full = os.path.join(path, name)
@@ -181,32 +252,26 @@ class Session(object):
                 continue
             try:
                 if os.path.isdir(full):
-                    entries.append('F d 0 %s' % to_hex(name))
+                    found.append('F d 0 %s' % to_hex(name))
                 elif name.lower().endswith(IMAGE_EXTS):
-                    entries.append('F f %d %s' % (os.path.getsize(full), to_hex(name)))
+                    found.append('F f %d %s' % (os.path.getsize(full), to_hex(name)))
             except OSError:
                 continue
-        for e in entries[:MAX_FILES]:
+            if len(found) >= MAX_FILES:
+                break
+        for e in found:
             if len(e) <= MAX_LINE:      # very long names are left out
                 self.send(e)
         self.send('END')
 
     def cmd_disks(self, args):
-        status = disk_control('status')
-        now = {}
-        if status:
-            for line in status.splitlines():
-                parts = line.split(' ', 2)
-                if len(parts) >= 2 and parts[0].isdigit():
-                    now[int(parts[0])] = (parts[1], parts[2] if len(parts) > 2 else '')
+        now = self.drive_status()
         for unit in range(NUM_DRIVES):
-            rw, name = now.get(unit, ('-', ''))
-            self.send('D %d %s %s' % (unit, rw if status else '?', to_hex(relative(name)) if name else '-'))
-        for e in read_json(DISK_CONF).get('auto-insert', []):
-            try:
-                self.send('A %d %d %s' % (int(e['unit']), 1 if e.get('rw') else 0, to_hex(relative(e['filename']))))
-            except (KeyError, ValueError, TypeError):
-                continue
+            rw, name = (now or {}).get(unit, ('-', ''))
+            self.send('D %d %s %s' % (unit, rw if now is not None else '?', to_hex(relative(name)) if name else '-'))
+        for e in entries(read_json(DISK_CONF), 'auto-insert'):
+            if isinstance(e.get('filename'), str) and e['filename'] and isinstance(e.get('unit'), int):
+                self.send('A %d %d %s' % (e['unit'], 1 if e.get('rw') else 0, to_hex(relative(e['filename']))))
         self.send('END')
 
     def cmd_insert(self, args):
@@ -224,7 +289,9 @@ class Session(object):
         self.answer(disk_control('eject %d' % unit))
 
     def answer(self, res):
-        if res is None:
+        if res is not None and res.startswith('Unknown command'):
+            self.send('ERR the disk service is too old for this')
+        elif res is None:
             self.send('ERR the disk service is not running (mount a PD drive first)')
         elif res.startswith(('Inserted', 'Ejected', 'No disk')):
             self.send('OK ' + res.strip())
@@ -241,19 +308,17 @@ class Session(object):
                 self.send('ERR not a disk image')
                 return
         j = read_json(DISK_CONF)
-        entries = [e for e in j.get('auto-insert', []) if isinstance(e, dict) and e.get('unit') != unit]
+        keep = [e for e in entries(j, 'auto-insert') if e.get('unit') != unit]
         if path:
-            entries.append({'unit': unit, 'filename': path, 'rw': rw})
-        j['auto-insert'] = sorted(entries, key=lambda e: e.get('unit', 0))
+            keep.append({'unit': unit, 'filename': path, 'rw': rw})
+        j['auto-insert'] = sorted(keep, key=lambda e: str(e.get('unit')))
         write_json(DISK_CONF, j)
         self.send('OK saved')
 
     def cmd_scsi(self, args):
-        for e in read_json(SCSI_CONF).get('units', []):
-            try:
-                self.send('S %d %d %s' % (int(e['unit']), 1 if e.get('rw') else 0, to_hex(relative(e['filename']))))
-            except (KeyError, ValueError, TypeError):
-                continue
+        for e in entries(read_json(SCSI_CONF), 'units'):
+            if isinstance(e.get('filename'), str) and e['filename'] and isinstance(e.get('unit'), int):
+                self.send('S %d %d %s' % (e['unit'], 1 if e.get('rw') else 0, to_hex(relative(e['filename']))))
         self.send('END')
 
     def cmd_scsiset(self, args):
@@ -266,13 +331,15 @@ class Session(object):
                 self.send('ERR not a disk image')
                 return
         j = read_json(SCSI_CONF)
-        old = [e for e in j.get('units', []) if isinstance(e, dict)]
+        old = entries(j, 'units')
         keep = [e for e in old if e.get('unit') != unit]
         if path:
-            # Keep the block size of a unit that had one
-            block = next((e.get('block_size', 512) for e in old if e.get('unit') == unit), 512)
-            keep.append({'unit': unit, 'filename': path, 'rw': rw, 'block_size': block})
-        j['units'] = sorted(keep, key=lambda e: e.get('unit', 0))
+            # The unit's entry is updated, keeping its other settings (such
+            # as the block size)
+            e = next((dict(e) for e in old if e.get('unit') == unit), {'unit': unit, 'block_size': 512})
+            e.update({'filename': path, 'rw': rw})
+            keep.append(e)
+        j['units'] = sorted(keep, key=lambda e: str(e.get('unit')))
         write_json(SCSI_CONF, j)
         self.send('OK saved')
 
