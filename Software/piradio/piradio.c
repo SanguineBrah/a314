@@ -201,7 +201,7 @@ static void start_connect(void)
 	pending_connect = TRUE;
 	conn_state = CS_CONNECTING;
 	conn_ticks = 0;
-	set_msg("CONNECTING TO THE PI...");
+	set_msg("Connecting to the Pi...");
 }
 
 static BOOL a314_idle(void)
@@ -475,7 +475,7 @@ static void handle_read_completed(void)
 
 	if (rmsg->a314_Request.io_Error != A314_READ_OK)
 	{
-		connection_lost("THE CONNECTION TO THE PI WAS LOST - RECONNECTING...");
+		connection_lost("The connection to the Pi was lost - reconnecting...");
 		return;
 	}
 	rx_idle_ticks = 0;
@@ -510,7 +510,7 @@ static void handle_connect_completed(void)
 		linelen = 0;
 		start_read();
 		queue_cmd("HELLO");
-		set_msg("CONNECTED, WAITING FOR THE PI...");
+		set_msg("Connected, waiting for the Pi...");
 	}
 	else
 	{
@@ -518,8 +518,8 @@ static void handle_connect_completed(void)
 		conn_state = CS_DOWN;
 		conn_ticks = 0;
 		set_msg(err == A314_CONNECT_UNKNOWN_SERVICE ?
-			"THE PIRADIO SERVICE IS NOT INSTALLED ON THE PI - RETRYING..." :
-			"CANNOT CONNECT TO THE PI - RETRYING...");
+			"The piradio service is not installed on the Pi - retrying..." :
+			"Cannot connect to the Pi - retrying...");
 	}
 }
 
@@ -537,7 +537,7 @@ static void handle_a314_port(void)
 		{
 			pending_write = FALSE;
 			if (wmsg->a314_Request.io_Error != A314_WRITE_OK && conn_state == CS_UP)
-				connection_lost("THE CONNECTION TO THE PI WAS LOST - RECONNECTING...");
+				connection_lost("The connection to the Pi was lost - reconnecting...");
 		}
 		else if (m == (struct Message *)xmsg)
 			pending_reset = FALSE;
@@ -558,9 +558,9 @@ static void connection_tick(void)
 	if (conn_state == CS_DOWN && conn_ticks >= RETRY_TICKS && a314_idle())
 		start_connect();
 	else if (conn_state == CS_CONNECTING && conn_ticks >= CONNECT_TIMEOUT_TICKS)
-		connection_lost("NO ANSWER FROM THE PI - RETRYING...");
+		connection_lost("No answer from the Pi - retrying...");
 	else if (conn_state == CS_UP && ++rx_idle_ticks >= RX_TIMEOUT_TICKS)
-		connection_lost("THE PI STOPPED RESPONDING - RECONNECTING...");
+		connection_lost("The Pi stopped responding - reconnecting...");
 }
 
 /* ---------------------------------------------------------------------- */
@@ -997,7 +997,7 @@ int main(int argc, char **argv)
 	if (a314_open)
 		start_connect();
 	else
-		set_msg("A314.DEVICE NOT FOUND - IS THE A314 SOFTWARE INSTALLED?");
+		set_msg("The A314 software (a314.device) is not installed");
 
 	portsig = 1L << mp->mp_SigBit;
 	timersig = 1L << timer_mp->mp_SigBit;

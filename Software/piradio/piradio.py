@@ -82,10 +82,10 @@ NOTICE_TIME = 4.0
 
 # Friendlier text for common rtl_fm and rtl_power errors
 ERROR_HINTS = [
-    ('No supported devices', 'NO RTL-SDR DONGLE FOUND'),
-    ('usb_claim_interface', 'THE DONGLE IS IN USE BY ANOTHER PROGRAM'),
-    ('LIBUSB_ERROR_NO_DEVICE', 'THE DONGLE WAS DISCONNECTED'),
-    ('Failed to open', 'CANNOT OPEN THE DONGLE'),
+    ('No supported devices', 'No RTL-SDR dongle found'),
+    ('usb_claim_interface', 'The dongle is in use by another program'),
+    ('LIBUSB_ERROR_NO_DEVICE', 'The dongle was disconnected'),
+    ('Failed to open', 'Cannot open the dongle'),
 ]
 
 SETTINGS = {
@@ -248,7 +248,7 @@ class Proc(object):
                 return hint
         lines = text.split('\n')
         lines = [l.strip() for l in lines if l.strip()]
-        return lines[-1].upper()[:60] if lines else 'EXITED UNEXPECTEDLY'
+        return lines[-1][:60] if lines else 'It stopped unexpectedly'
 
     def stop(self):
         # rtl_fm and rtl_power have nothing to save, and asked politely to
@@ -470,7 +470,7 @@ class Radio(object):
         elif now < self.notice_until:
             msg = self.notice
         elif self.pipe is None:
-            msg = 'NO AUDIO OUTPUT - IS THE PIAUDIO SERVICE RUNNING?'
+            msg = 'No sound output - is PiAudio running on the Amiga?'
         else:
             msg = ''
         if msg != self.msg:
@@ -496,7 +496,7 @@ class Radio(object):
         try:
             self.fm = Proc(argv)
         except OSError as e:
-            self.fail('CANNOT RUN RTL_FM: ' + e.strerror.upper())
+            self.fail('Cannot run rtl_fm: ' + e.strerror)
             return
         self.error = None
         self.tuned_at = time.time()
@@ -635,7 +635,7 @@ class Radio(object):
         try:
             self.sweep = Proc(argv)
         except OSError as e:
-            self.fail('CANNOT RUN RTL_POWER: ' + e.strerror.upper())
+            self.fail('Cannot run rtl_power: ' + e.strerror)
             self.retune_at = time.time()    # carry on listening
             return
         self.sweep_out = b''
@@ -663,7 +663,7 @@ class Radio(object):
         if chans is None:
             self.scan_dir = 0
             self.send_state()
-            self.notify('SWEEP FAILED: ' + proc.error_text())
+            self.notify('The sweep failed: ' + proc.error_text())
         else:
             logger.info('Sweep of %s found %d active channels', self.cur.name, len(chans))
             self.activity[self.band] = (time.time(), chans)
@@ -671,7 +671,7 @@ class Radio(object):
             if not chans:
                 self.scan_dir = 0
                 self.send_state()
-                self.notify('NO ACTIVE CHANNELS FOUND')
+                self.notify('No active channels found')
             elif after == 'seek':
                 self.go_to_active(self.seek_dir, wrap=True)
             elif after == 'scan':
@@ -681,7 +681,7 @@ class Radio(object):
                 self.freq = self.cur.freq_of(chans[0] if self.scan_dir > 0 else chans[-1])
                 self.send_state()
             else:
-                self.notify('FOUND %d ACTIVE CHANNELS' % len(chans))
+                self.notify('Found %d active channels' % len(chans))
         self.start_fm()
 
     def find_active(self, csv):
@@ -769,7 +769,7 @@ class Radio(object):
             if 0 <= arg < len(self.regions) and arg != self.region:
                 self.set_region(arg)
                 self.send_info()
-                self.notify('REGION: ' + self.regions[arg][0].upper())
+                self.notify('Region: ' + self.regions[arg][0])
                 self.retune(now=True)
             return
         if cmd == 'BAND':
@@ -857,14 +857,14 @@ class Radio(object):
 
         if self.sweep and now - self.sweep.started > SWEEP_TIMEOUT:
             self.stop_sweep()
-            self.fail('THE SWEEP TOOK TOO LONG')
+            self.fail('The sweep took too long')
 
         # rtl_fm can hang without exiting if the dongle glitches. With the
         # squelch on it is silent anyway, so this is only checked without.
         if (self.fm and self.sql == 0 and self.retune_at is None and
                 now - max(self.last_audio, self.fm.started) > NO_AUDIO_TIMEOUT):
             self.stop_fm()
-            self.fail('NO DATA FROM THE DONGLE')
+            self.fail('No data from the dongle')
 
         if self.pipe is None and self.fm and now - self.pipe_tried_at >= 1.0:
             self.pipe_tried_at = now
