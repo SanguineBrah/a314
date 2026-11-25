@@ -588,11 +588,8 @@ static LONG load(struct ClassBase *base, struct IClass *cl, Object *obj)
 				m.pbpa_Top = y;
 				m.pbpa_Width = w;
 				m.pbpa_Height = n;
-				if (!DoSuperMethodA(cl, obj, (Msg)&m))
-				{
-					err = ERROR_NO_FREE_STORE;
-					goto out;
-				}
+				/* No return value is documented for this method */
+				DoSuperMethodA(cl, obj, (Msg)&m);
 			}
 			else
 				chunky_to_planar(bm, tmp, y, n, w);

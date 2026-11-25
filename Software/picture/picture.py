@@ -66,6 +66,7 @@ SERVICE_NAME = 'picture'
 MAX_FILE = 64 * 1024 * 1024
 MAX_LINE = 251
 DECODE_SECONDS = 45             # the Amiga waits 60
+MAX_CHILDREN = 2                # decodings at once; others wait
 PHYS_MEM = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
 # Decoding takes several times the size of the picture in memory; a
 # child may use at most half of the Pi's memory
@@ -341,24 +342,29 @@ def decode_tiff(data, maxw, maxh):
     lib.TIFFReadRGBAImageOriented.argtypes = [vp, ctypes.c_uint32, ctypes.c_uint32, vp, ctypes.c_int, ctypes.c_int]
     TIFFTAG_IMAGEWIDTH, TIFFTAG_IMAGELENGTH, ORIENTATION_TOPLEFT = 256, 257, 1
 
-    # libtiff reads files, so the data goes into a temporary one
-    with tempfile.NamedTemporaryFile(suffix='.tif') as f:
-        f.write(data)
-        f.flush()
-        tif = lib.TIFFOpen(f.name.encode(), b'r')
-        if not tif:
-            raise DecodeError(DTERROR_INVALID_DATA, 'bad TIFF data')
-        try:
-            w, h = ctypes.c_uint32(0), ctypes.c_uint32(0)
-            lib.TIFFGetField(ctypes.c_void_p(tif), TIFFTAG_IMAGEWIDTH, ctypes.byref(w))
-            lib.TIFFGetField(ctypes.c_void_p(tif), TIFFTAG_IMAGELENGTH, ctypes.byref(h))
-            w, h = w.value, h.value
-            check_size(w, h)
-            raster = ctypes.create_string_buffer(w * h * 4)
-            if not lib.TIFFReadRGBAImageOriented(tif, w, h, raster, ORIENTATION_TOPLEFT, 0):
-                raise DecodeError(DTERROR_INVALID_DATA, 'cannot read this TIFF')
-        finally:
-            lib.TIFFClose(tif)
+    # libtiff reads files, so the data goes into a temporary one, which is
+    # deleted as soon as libtiff has it open (so that nothing is left behind
+    # if this process is killed)
+    fd, path = tempfile.mkstemp(suffix='.tif')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        tif = lib.TIFFOpen(path.encode(), b'r')
+    finally:
+        os.unlink(path)
+    if not tif:
+        raise DecodeError(DTERROR_INVALID_DATA, 'bad TIFF data')
+    try:
+        w, h = ctypes.c_uint32(0), ctypes.c_uint32(0)
+        lib.TIFFGetField(ctypes.c_void_p(tif), TIFFTAG_IMAGEWIDTH, ctypes.byref(w))
+        lib.TIFFGetField(ctypes.c_void_p(tif), TIFFTAG_IMAGELENGTH, ctypes.byref(h))
+        w, h = w.value, h.value
+        check_size(w, h)
+        raster = ctypes.create_string_buffer(w * h * 4)
+        if not lib.TIFFReadRGBAImageOriented(tif, w, h, raster, ORIENTATION_TOPLEFT, 0):
+            raise DecodeError(DTERROR_INVALID_DATA, 'cannot read this TIFF')
+    finally:
+        lib.TIFFClose(tif)
     # Each pixel is a little-endian ABGR word: bytes R, G, B, A
     return w, h, rgba_to_rgb(raster.raw, w, h)
 
@@ -476,8 +482,13 @@ def decode_all(data, maxw, maxh, mode, colours, bufsize):
     return w, h, src[0], src[1], fmt, palette, pixels
 
 
-def child(data, args, fd):
+def child(data, args, fd, close_fds):
     # The child process: limits, decoding, the result into the pipe
+    for f in close_fds:
+        try:
+            os.close(f)
+        except OSError:
+            pass
     resource.setrlimit(resource.RLIMIT_DATA, (CHILD_MEM, CHILD_MEM))
     resource.setrlimit(resource.RLIMIT_CPU, (DECODE_SECONDS, DECODE_SECONDS + 5))
     try:
@@ -518,6 +529,7 @@ class Job(object):
         self.result = bytearray()
         self.deadline = 0
         self.mode = 'rgb'
+        self.waiting = None         # a DECODE waiting for a free child
 
     def send(self, line):
         self.service.send(self.stream_id, line.encode('latin-1')[:MAX_LINE])
@@ -544,29 +556,36 @@ class Job(object):
         elif cmd == 'DECODE' and len(args) >= 3 and isinstance(args[0], int) and isinstance(args[1], int) \
                 and self.buf and self.pid is None:
             colours = args[3] if len(args) > 3 and isinstance(args[3], int) else 256
-            self.start_decode(max(16, args[0]), max(16, args[1]), args[2], colours)
-        elif cmd == 'NEXT' and self.pid is None:
+            self.waiting = (max(16, args[0]), max(16, args[1]), args[2], colours)
+            self.service.start_waiting()
+        elif cmd == 'NEXT' and self.pid is None and self.waiting is None:
             self.next_block()
         else:
             logger.warning('Unexpected command %r', line[:40])
 
-    def start_decode(self, maxw, maxh, mode, colours):
+    def start_decode(self):
+        maxw, maxh, mode, colours = self.waiting
+        self.waiting = None
         self.mode = 'pal' if mode == 'pal' else 'rgb'
-        data = bytes(self.data)
+        data = self.data
         self.data = bytearray()
+        # The child closes what it doesn't need of the parent's: the a314d
+        # socket and the other children's pipes
+        others = [self.service.a314d.fileno()] + \
+            [j.pipe for j in self.service.jobs.values() if j.pipe is not None]
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:
             os.close(r)
             try:
-                child(data, (maxw, maxh, self.mode, colours, self.buf[1]), w)
+                child(bytes(data), (maxw, maxh, self.mode, colours, self.buf[1]), w, others)
             finally:
                 os._exit(0)
         os.close(w)
         os.set_blocking(r, False)
         self.pid, self.pipe = pid, r
         self.result = bytearray()
-        self.deadline = time.time() + DECODE_SECONDS + 5
+        self.deadline = time.monotonic() + DECODE_SECONDS + 5
 
     def child_output(self):
         # Reads what the child has written; True when it has finished
@@ -576,6 +595,8 @@ class Job(object):
             return False
         if d:
             self.result += d
+            # Still sending its result: not stuck
+            self.deadline = max(self.deadline, time.monotonic() + 5)
             return False
         self.finish_decode()
         return True
@@ -586,18 +607,18 @@ class Job(object):
         os.close(self.pipe)
         _, status = os.waitpid(self.pid, 0)
         self.pid = self.pipe = None
-        r = bytes(self.result)
+        r = self.result
         self.result = bytearray()
         if timed_out:
             self.send('ERR %d decoding took too long' % DTERROR_INVALID_DATA)
         elif r[:1] == b'\1' and len(r) >= 5:
-            self.send('ERR %d %s' % (struct.unpack_from('=I', r, 1)[0], r[5:].decode('latin-1')))
+            self.send('ERR %d %s' % (struct.unpack_from('=I', r, 1)[0], bytes(r[5:]).decode('latin-1')))
         elif r[:1] == b'\0' and len(r) >= 37:
             w, h, fw, fh, plen = struct.unpack_from('=IIIII', r, 1)
-            fmt = r[21:37].rstrip(b' ').decode()
+            fmt = bytes(r[21:37]).rstrip(b' ').decode()
             self.bpp = 1 if self.mode == 'pal' else 3
-            self.palette = r[37:37 + plen] or None
-            self.pixels = r[37 + plen:]
+            self.palette = bytes(r[37:37 + plen]) or None
+            self.pixels = memoryview(r)[37 + plen:]    # not another copy
             if len(self.pixels) != w * h * self.bpp:
                 self.pixels = self.palette = None
                 self.send('ERR %d bad decoder result' % DTERROR_INVALID_DATA)
@@ -635,11 +656,12 @@ class Job(object):
             return
         n = min(size // row, self.h - self.next_row)
         y = self.next_row
-        self.service.write_mem(address, self.pixels[y * row:(y + n) * row])
+        self.service.write_mem(address, bytes(self.pixels[y * row:(y + n) * row]))
         self.next_row += n
         self.send('ROWS %d %d' % (y, n))
 
     def close(self):
+        self.waiting = None
         if self.pid is not None:
             os.kill(self.pid, signal.SIGKILL)
             os.close(self.pipe)
@@ -652,6 +674,19 @@ class PictureService(object):
         self.a314d = A314d(SERVICE_NAME)
         self.jobs = {}
         self.pending = []
+        # Loaded once here, so that every child has them already
+        for name in ('webp', 'webpdemux', 'heif', 'jxl', 'tiff'):
+            load(name)
+
+    def start_waiting(self):
+        # Starts waiting decodings while there are free children
+        running = sum(1 for j in self.jobs.values() if j.pid is not None)
+        for j in self.jobs.values():
+            if running >= MAX_CHILDREN:
+                break
+            if j.waiting is not None and j.pid is None:
+                j.start_decode()
+                running += 1
 
     def send(self, stream_id, data):
         self.a314d.send_data(stream_id, data)
@@ -696,6 +731,7 @@ class PictureService(object):
                 self.a314d.send_eos(stream_id)
             job.close()
             del self.jobs[stream_id]
+            self.start_waiting()
 
     def run(self):
         while True:
@@ -704,14 +740,15 @@ class PictureService(object):
             pipes = {j.pipe: j for j in self.jobs.values() if j.pipe is not None}
             rl, _, _ = select.select([self.a314d] + list(pipes), [], [], 1.0)
             for fd in rl:
-                if fd in pipes:
-                    pipes[fd].child_output()
+                if fd in pipes and pipes[fd].child_output():
+                    self.start_waiting()
             if self.a314d in rl:
                 self.handle_msg(*self.a314d.wait_for_msg())
-            now = time.time()
+            now = time.monotonic()
             for j in list(self.jobs.values()):
                 if j.pid is not None and now > j.deadline:
                     j.finish_decode(timed_out=True)
+                    self.start_waiting()
 
 
 if __name__ == '__main__':
