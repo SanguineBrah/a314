@@ -620,12 +620,30 @@ struct Gui *gui_open(const char *title, const struct GuiItem *items, int nitems,
 	if (!gui->font)
 		goto fail;
 
-	/* The grid, from the font */
+	/* The grid, from the font: rows with gaps between them, closer
+	   together if the window wouldn't fit on the screen (as on a 1.3
+	   Workbench, 200 or 256 lines high) */
 	gui->cw = (text_width(gui, "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ") + 52) / 53;
-	gui->rh = gui->font->tf_YSize + 6;
-	gui->step = gui->rh + 4;
 	gui->mx = 10;
 	gui->my = 6;
+	{
+		int rows = 0, gap, avail = sh - bt - bb - 2 * gui->my;
+		for (i = 0; i < nitems; i++)
+		{
+			int end = items[i].y + (items[i].kind == GUI_LIST ? items[i].h : 1);
+			if (end > rows)
+				rows = end;
+		}
+		gui->rh = gui->font->tf_YSize + 6;
+		for (gap = 4; gap > 0 && rows * (gui->rh + gap) - gap > avail; gap--)
+			;
+		if (rows * (gui->rh + gap) - gap > avail)
+		{
+			gui->rh = gui->font->tf_YSize + 4;
+			gap = 1;
+		}
+		gui->step = gui->rh + gap;
+	}
 	for (i = 0; i < nitems; i++)
 	{
 		struct Item *t = &gui->items[i];
