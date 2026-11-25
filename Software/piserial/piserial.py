@@ -26,7 +26,7 @@
 #   SET <baud> <bits> <parity> <stop> <handshake>   change the settings
 #   CREDIT <n>              the Amiga has read n more bytes
 #   BREAK <microseconds>    send a break
-#   FLUSH                   throw away data not yet sent or received
+#   CLEAR                   throw away data received but not yet sent
 #
 # Pi -> Amiga replies:
 #   PORT <free> <port> <description>, then END   the port list
@@ -71,6 +71,15 @@ RX_BUFFER = 4096            # data read from the port but not yet sent
 POLL_SECONDS = 0.25         # how often modem lines and unplugged ports are checked
 
 CMSPAR = 0o10000000000      # mark/space parity (Linux), missing from termios
+
+# For baud rates without a B<rate> constant (such as MIDI's 31250): struct
+# termios2 and its ioctls, as defined for Linux on ARM and x86.
+TCGETS2, TCSETS2 = 0x802C542A, 0x402C542B
+BOTHER, CBAUD = 0o010000, 0o010017
+TERMIOS2 = '4I B 19s 2I'
+MAX_BAUD = 4000000
+
+TIOCSBRK, TIOCCBRK = 0x5427, 0x5428     # start and end a break (Linux)
 
 ERR_BUSY, ERR_BAUD, ERR_PARAM, ERR_NO_PORT = 1, 2, 5, 32
 
@@ -122,9 +131,9 @@ class Settings(object):
     def apply(self, fd):
         # Raises OSError if the port doesn't accept them, KeyError if the
         # baud rate isn't one Linux knows.
-        speed = getattr(termios, 'B%d' % self.baud, None)
-        if speed is None:
+        if not 50 <= self.baud <= MAX_BAUD:
             raise KeyError(self.baud)
+        speed = getattr(termios, 'B%d' % self.baud, termios.B38400)
         iflag, oflag, cflag, lflag, ispeed, ospeed, cc = termios.tcgetattr(fd)
         iflag = termios.IGNBRK if self.parity == 'n' else termios.IGNBRK | termios.INPCK
         if self.handshake == 'xon':
@@ -147,6 +156,17 @@ class Settings(object):
         cc[termios.VTIME] = 0
         termios.tcsetattr(fd, termios.TCSANOW,
             [iflag, oflag, cflag, lflag, speed, speed, cc])
+        if not hasattr(termios, 'B%d' % self.baud):
+            self.set_other_baud(fd)
+
+    def set_other_baud(self, fd):
+        t = list(struct.unpack(TERMIOS2, fcntl.ioctl(fd, TCGETS2, bytes(44))))
+        t[2] = (t[2] & ~CBAUD) | BOTHER
+        t[6] = t[7] = self.baud
+        try:
+            fcntl.ioctl(fd, TCSETS2, struct.pack(TERMIOS2, *t))
+        except OSError:
+            raise KeyError(self.baud)
 
 
 class Port(object):
@@ -163,6 +183,7 @@ class Port(object):
         self.rx = b''               # read from the port, not yet sent
         self.tx = b''               # from the Amiga, not yet written
         self.lines = None
+        self.break_until = None     # when the break being sent ends
 
     def send_line(self, text):
         self.service.send(self.stream_id, b'C' + text.encode('latin-1'))
@@ -194,6 +215,7 @@ class Port(object):
         if self.fd is not None:
             self.release(self.fd)
             self.fd = None
+        self.break_until = None
 
     def open(self, words):
         if self.name is not None or len(words) != 7:
@@ -288,21 +310,19 @@ class Port(object):
             self.credit += int(args[0])
             self.flush_rx()
         elif cmd == 'BREAK' and len(args) == 1 and args[0].isdigit():
-            if self.fd is not None:
-                # tcsendbreak() only knows "about 0.25 s", so this is a
-                # break of at least the requested length.
+            # tcsendbreak() only knows "about 0.25 s", so the break is
+            # started here and ended by end_break().
+            if self.fd is not None and self.break_until is None:
                 try:
-                    fcntl.ioctl(self.fd, termios.TIOCSBRK)
-                    time.sleep(min(int(args[0]), 2000000) / 1000000)
-                    fcntl.ioctl(self.fd, termios.TIOCCBRK)
+                    fcntl.ioctl(self.fd, TIOCSBRK)
+                    self.break_until = time.time() + min(int(args[0]), 2000000) / 1000000
                 except OSError:
                     pass
-        elif cmd == 'FLUSH':
+        elif cmd == 'CLEAR':
             self.rx = b''
-            self.drop_tx()
             if self.fd is not None:
                 try:
-                    termios.tcflush(self.fd, termios.TCIOFLUSH)
+                    termios.tcflush(self.fd, termios.TCIFLUSH)
                 except termios.error:
                     pass
         else:
@@ -321,7 +341,7 @@ class Port(object):
         self.write_some()
 
     def write_some(self):
-        if self.fd is None or not self.tx:
+        if not self.wants_write():
             return
         try:
             n = os.write(self.fd, self.tx)
@@ -359,7 +379,15 @@ class Port(object):
         return self.fd is not None and len(self.rx) < RX_BUFFER
 
     def wants_write(self):
-        return self.fd is not None and bool(self.tx)
+        return self.fd is not None and bool(self.tx) and self.break_until is None
+
+    def end_break(self):
+        if self.break_until is not None and time.time() >= self.break_until:
+            self.break_until = None
+            try:
+                fcntl.ioctl(self.fd, TIOCCBRK)
+            except OSError:
+                pass
 
     def poll(self):
         # Checks the modem lines, and whether an unplugged port is back
@@ -431,11 +459,13 @@ class SerialService(object):
         while True:
             readers = [self.a314d] + [p.fd for p in self.ports.values() if p.wants_read()]
             writers = [p.fd for p in self.ports.values() if p.wants_write()]
-            timeout = max(0, next_poll - time.time())
+            wake = [next_poll] + [p.break_until for p in self.ports.values() if p.break_until]
+            timeout = max(0, min(wake) - time.time())
             rl, wl, _ = select.select(readers, writers, [], timeout)
             if self.a314d in rl:
                 self.handle_msg()
             for port in list(self.ports.values()):
+                port.end_break()
                 if port.fd in wl:
                     port.write_some()
                 if port.fd in rl:
