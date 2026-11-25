@@ -238,6 +238,11 @@ void submit_ahi_req(int index)
 	}
 
 	req->ahir_Std.io_Message.mn_ReplyPort = async_mp;
+	/* Below other programs' sounds (priority 0), so that when the AHI
+	   unit has no channel left for them, AHI plays theirs and mutes
+	   PiAudio for the moment, rather than the other way round (PiAudio
+	   keeps a channel busy even when the Pi sends silence). */
+	req->ahir_Std.io_Message.mn_Node.ln_Pri = -50;
 	req->ahir_Std.io_Command = CMD_WRITE;
 	req->ahir_Std.io_Data = ahi_buffers[slot];
 	req->ahir_Std.io_Length = SAMPLES * 2;

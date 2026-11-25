@@ -13,7 +13,7 @@ On Kickstart 2.04 or later with [AHI](https://aminet.net/package/driver/audio/ah
 ```
 run piaudio AHI >NIL:
 ```
-From the Workbench, change the icon's `(AHI)` ToolType to `AHI` (in the icon's Information window). Then piaudio doesn't take two Paula channels for itself, and its sound is mixed with other programs that play through AHI. It uses AHI's default unit (unit 0), as set in the AHI preferences. Programs that use audio.device or the audio hardware directly still compete with AHI for the Paula channels.
+From the Workbench, change the icon's `(AHI)` ToolType to `AHI` (in the icon's Information window). Then piaudio doesn't take two Paula channels for itself, and its sound is mixed with other programs that play through AHI. It uses AHI's default unit (unit 0), as set in the AHI preferences. For PiAudio's sound to be mixed with other programs' sounds, give that unit more than one channel in the AHI preferences; with one channel, another program's sound takes the channel while it plays, and PiAudio is quiet meanwhile. Programs that use audio.device or the audio hardware directly still compete with AHI for the Paula channels.
 
 The file *.asoundrc* should be stored in `/home/pi` on the RPi. Most programs that play audio on the RPi can then be used. One such program is mpg123, which is started as:
 ```
