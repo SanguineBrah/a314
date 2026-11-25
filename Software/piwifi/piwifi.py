@@ -74,6 +74,11 @@ NM = ['org.freedesktop.NetworkManager', '/org/freedesktop/NetworkManager',
     'org.freedesktop.NetworkManager']
 
 
+def sentence(text):
+    # An error message as a sentence: its first letter in upper case
+    return text[:1].upper() + text[1:]
+
+
 class Failed(Exception):
     pass
 
@@ -267,7 +272,7 @@ class WiFi(object):
                     raise Failed('wrong password for ' + ssid)
                 raise
 
-            progress('CHECKING INTERNET ACCESS...')
+            progress('Checking internet access...')
             if not self.has_internet(dev):
                 raise Failed('no internet access through ' + ssid)
             if new_profile:
@@ -275,7 +280,7 @@ class WiFi(object):
             run(['busctl', 'call'] + NM + ['CheckpointDestroy', 'o', checkpoint], sudo=True)
         except Exception as e:
             logger.warning('Going back to the previous network: %s', e)
-            progress('GOING BACK TO THE PREVIOUS NETWORK...')
+            progress('Going back to the previous network...')
             try:
                 run(['busctl', 'call'] + NM + ['CheckpointRollback', 'o', checkpoint], sudo=True)
             except Failed:
@@ -381,25 +386,25 @@ class Service(object):
             if job == 'STATUS':
                 lines = [self.status_line()]
             elif job == 'SCAN':
-                self.post(['BUSY SCANNING...'])
-                lines = self.network_lines() + [self.status_line(), 'DONE 1 SCAN COMPLETE']
+                self.post(['BUSY Scanning...'])
+                lines = self.network_lines() + [self.status_line(), 'DONE 1 Scan complete']
             elif job == 'CONNECT':
                 ssid, password = args
-                self.post(['BUSY CONNECTING TO %s...' % ssid.upper()])
+                self.post(['BUSY Connecting to %s...' % ssid])
                 self.wifi.connect(ssid, password, lambda text: self.post(['BUSY ' + text]))
-                lines = self.network_lines() + [self.status_line(), 'DONE 1 CONNECTED TO ' + ssid.upper()]
+                lines = self.network_lines() + [self.status_line(), 'DONE 1 Connected to ' + ssid]
             elif job == 'FORGET':
                 self.wifi.forget(args[0])
-                lines = self.network_lines() + ['DONE 1 FORGOT ' + args[0].upper()]
+                lines = self.network_lines() + ['DONE 1 Forgot ' + args[0]]
         except Failed as e:
-            lines = ['DONE 0 ' + str(e).upper()]
+            lines = ['DONE 0 ' + sentence(str(e))]
             try:
                 lines.insert(0, self.status_line())
             except Failed:
                 pass
         except Exception:
             logger.exception('Unexpected error')
-            lines = ['DONE 0 UNEXPECTED ERROR, SEE JOURNALCTL -U A314D']
+            lines = ['DONE 0 Unexpected error, see journalctl -u a314d on the Pi']
         lines.append('IDLE')
         self.post(lines)
 

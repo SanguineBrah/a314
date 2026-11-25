@@ -80,6 +80,6 @@ ${BIN}/C/A314shd: a314device/a314.h a314sh/a314shd.c
 	${VC} a314sh/a314shd.c -lamiga -o ${BIN}/C/A314shd
 
 all: ${BIN}/Prefs/A314/WiFi
-${BIN}/Prefs/A314/WiFi: a314device/a314.h piwifi/piwifi.c piwifi/WiFi.info ${BIN}/Prefs/A314.info
-	${VC} piwifi/piwifi.c -lamiga -o ${BIN}/Prefs/A314/WiFi
+${BIN}/Prefs/A314/WiFi: a314device/a314.h piwifi/piwifi.c prefs/a314gui.c prefs/a314gui.h piwifi/WiFi.info ${BIN}/Prefs/A314.info
+	${VC} piwifi/piwifi.c prefs/a314gui.c -lamiga -o ${BIN}/Prefs/A314/WiFi
 	cp piwifi/WiFi.info ${BIN}/Prefs/A314/WiFi.info
