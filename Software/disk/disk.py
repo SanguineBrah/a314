@@ -40,6 +40,7 @@ class Drive(object):
     def __init__(self, unit: int):
         self.unit = unit
         self.f: Optional[io.BufferedRandom] = None
+        self.filename: Optional[str] = None
         self.writable = False
         self.geometry: Optional[Tuple[int, int, int]] = None
         self.geometry_sent = False
@@ -76,6 +77,7 @@ class DiskService(object):
 
         drive.f.close()
         drive.f = None
+        drive.filename = None
 
         if self.current_stream_id is not None:
             self.a314d.send_data(self.current_stream_id, struct.pack('>BB', EJECT_NOTIFY, unit))
@@ -111,6 +113,7 @@ class DiskService(object):
             return "Failed: A disk with a different geometry was previously inserted"
 
         drive.f = f
+        drive.filename = filename
         drive.writable = writable
         drive.geometry = geometry
 
@@ -277,6 +280,11 @@ class DiskService(object):
             if cmd == 'eject':
                 unit = int(arr[1])
                 res = self.eject_adf(unit)
+            elif cmd == 'status':
+                # One line per drive: unit, rw/ro (or - if empty), file
+                res = '\n'.join('%d %s %s' % (d.unit,
+                    ('rw' if d.writable else 'ro') if d.f else '-', d.filename or '')
+                    for d in self.drives)
             elif cmd == 'insert':
                 unit = int(arr[1])
                 rw = arr[2] == '-rw'

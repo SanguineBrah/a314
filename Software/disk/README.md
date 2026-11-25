@@ -55,6 +55,11 @@ command:
 
 `echo eject 0 | nc localhost 23890`
 
+The `status` command lists the drives, one line each, with the unit, `rw`
+or `ro` (or `-` if the drive is empty) and the disk image:
+
+`echo status | nc localhost 23890`
+
 ## Mounting the drive
 
 Before being able to use the virtual drive you have to mount it on the Amiga.
