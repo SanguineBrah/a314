@@ -40,6 +40,7 @@
 extern struct IntuitionBase *IntuitionBase;
 extern struct GfxBase *GfxBase;
 struct Library *GadToolsBase = NULL;
+static int gadtools_users = 0;		/* windows open with it */
 
 struct Item
 {
@@ -566,9 +567,11 @@ struct Gui *gui_open(const char *title, const struct GuiItem *items, int nitems,
 		parse_label(t);
 	}
 
-	if (IntuitionBase->LibNode.lib_Version >= 37)
+	if (!GadToolsBase && IntuitionBase->LibNode.lib_Version >= 37)
 		GadToolsBase = OpenLibrary((STRPTR)"gadtools.library", 37);
 	gui->gt = GadToolsBase != NULL;
+	if (gui->gt)
+		gadtools_users++;
 
 	if (gui->gt)
 	{
@@ -756,10 +759,12 @@ void gui_close(struct Gui *gui)
 		free_nodes(&gui->items[i]);
 	if (gui->font)
 		CloseFont(gui->font);
-	free(gui);
-	if (GadToolsBase)
+	if (gui->gt && --gadtools_users == 0)
+	{
 		CloseLibrary(GadToolsBase);
-	GadToolsBase = NULL;
+		GadToolsBase = NULL;
+	}
+	free(gui);
 }
 
 ULONG gui_signal(struct Gui *gui)
