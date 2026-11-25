@@ -197,10 +197,12 @@ void report(const char *text)
 }
 
 /* Reads the options from the icon's ToolTypes, when started from
-   Workbench: AHI selects AHI output. */
+   Workbench: AHI selects AHI output. The icon is the last argument: the
+   program's own icon, or a project icon (such as Tools/PiAudio) whose
+   default tool is C:PiAudio. */
 void read_tooltypes()
 {
-	struct WBArg *arg = _WBenchMsg->sm_ArgList;
+	struct WBArg *arg = &_WBenchMsg->sm_ArgList[_WBenchMsg->sm_NumArgs - 1];
 	struct DiskObject *icon;
 	BPTR old_dir;
 

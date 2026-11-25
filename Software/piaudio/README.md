@@ -7,7 +7,7 @@ The *piaudio* program should run on the Amiga. It allocates two sounds channels,
 run piaudio >NIL:
 ```
 
-PiAudio can also be used from the Workbench. Copy *PiAudio* and *PiAudio.info* to a drawer and double-click the icon to start it. Double-clicking it again asks whether to stop it. To start PiAudio with the Workbench, put the two files in the WBStartup drawer (Workbench 2.0 or later).
+PiAudio can also be used from the Workbench. *PiAudio.info* is a project icon that starts `C:PiAudio`; copy it to SYS:Tools (it doesn't need a file of its own) and double-click it to start PiAudio. Double-clicking it again asks whether to stop it. To start PiAudio with the Workbench, put the icon in the WBStartup drawer instead (Workbench 2.0 or later).
 
 On Kickstart 2.04 or later with [AHI](https://aminet.net/package/driver/audio/ahiusr_4.18) installed, piaudio can play through AHI instead:
 ```
