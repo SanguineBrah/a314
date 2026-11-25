@@ -47,6 +47,7 @@ time.
   active channels until it is pressed again. With the squelch off, it stays
   on each channel for `scan_dwell_seconds`. With the squelch on, it stays
   while there is a signal, and moves on after `scan_hang_seconds` of quiet.
+- REGION steps to the next region's band list (see Configuration).
 - SWEEP looks for active channels again. Seek and scan sweep the band with
   `rtl_power` when there is no recent sweep, and scan sweeps again each
   time it reaches the end of the band. Audio stops for the second or two a
@@ -70,10 +71,16 @@ time.
 
 ## Configuration
 
-The bands and other settings are in `/etc/opt/a314/piradio.conf`, a JSON
-file that `install-pi.sh` creates from [piradio.conf](piradio.conf). The
-bands in it are examples: change them to suit your country, and check what
-you are allowed to listen to where you live.
+PiRadio comes with band lists for several regions: UK and Europe, North
+America, Australia and NZ, and Japan. Click REGION to step through them.
+The region is remembered, and so is the band and frequency you were using
+in each region. Check what you are allowed to listen to where you live.
+
+The regions and other settings are in `/etc/opt/a314/piradio.conf`, a JSON
+file that `install-pi.sh` creates from [piradio.conf](piradio.conf), so
+other regions or bands can be added there. `"regions"` maps each region's
+name to its list of bands; a plain `"bands"` list instead is used as a
+single region.
 
 Each band has `short` (button label, up to 6 characters), `name`, `lo` and
 `hi` (band edges in Hz), `step` (channel spacing in Hz) and `mode` (`wbfm`,
@@ -81,7 +88,7 @@ Each band has `short` (button label, up to 6 characters), `name`, `lo` and
 squelch level), `rate` (the demodulation sample rate, rounded up to a
 multiple of 18000 Hz; the default is 180000 for `wbfm` and 18000 otherwise)
 and `args` (extra `rtl_fm` arguments, e.g. `["-E", "direct2"]`). Up to 10
-bands are used.
+regions, each with up to 10 bands, are used.
 
 The other settings are `ppm` (frequency correction), `device_index` (which
 dongle), `gains` (the RF gain steps in tenths of a dB, 0 or more), the paths to

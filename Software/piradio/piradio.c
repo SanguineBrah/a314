@@ -37,6 +37,7 @@
 #define PORT_NAME	"PiRadio"
 
 #define MAX_BANDS	10
+#define MAX_REGIONS	10
 #define MAX_GAINS	40
 #define MAX_ACTIVE	200
 #define SQL_MAX		200
@@ -95,6 +96,7 @@
 #define GID_SEEK_UP	21
 #define GID_SCAN	22
 #define GID_SWEEP	23
+#define GID_REGION	24
 #define GID_VOL		30
 #define GID_SQL		31
 #define GID_GAIN	32
@@ -157,6 +159,8 @@ static BOOL timer_open = FALSE, timer_pending = FALSE;
 /* What is known about the radio */
 static struct Band bands[MAX_BANDS];
 static int nbands = 0;
+static char regions[MAX_REGIONS][32];	/* names of the band lists */
+static int nregions = 0, cur_region = 0;
 static WORD gains[MAX_GAINS];
 static int ngains = 0;
 static LONG active[MAX_ACTIVE];		/* active channels of the current band */
@@ -202,9 +206,10 @@ static struct Gadget band_gadgets[MAX_BANDS];
 static struct IntuiText band_texts[MAX_BANDS];
 static int nband_gadgets = 0;
 
-static const char *button_labels[4] = { "<< SEEK", "SEEK >>", "SCAN", "SWEEP" };
-static struct Gadget buttons[4];
-static struct IntuiText button_texts[4];
+#define NBUTTONS	5
+static const char *button_labels[NBUTTONS] = { "<< SEEK", "SEEK >>", "SCAN", "SWEEP", "REGION" };
+static struct Gadget buttons[NBUTTONS];
+static struct IntuiText button_texts[NBUTTONS];
 
 static const char *slider_labels[3] = { "VOL", "SQL", "GAIN" };
 static struct Gadget sliders[3];
@@ -226,7 +231,7 @@ static void init_gadgets(void)
 {
 	int i;
 
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < NBUTTONS; i++)
 	{
 		struct Gadget *g = &buttons[i];
 		init_text(&button_texts[i], button_labels[i], BUTTON_W);
@@ -604,6 +609,15 @@ static void draw_values(void)
 static void draw_bands(void)
 {
 	int i;
+
+	clear(272, METER_Y - 1, INNER_W - 272, 8);
+	if (nregions > 1 && have_state)
+	{
+		char buf[48];
+		sprintf(buf, "REGION: %s", regions[cur_region]);
+		SetAPen(rp, 1);
+		print_at(272, METER_Y - 1, buf, (INNER_W - 280) / 8);
+	}
 	for (i = 0; i < nband_gadgets; i++)
 	{
 		SetAPen(rp, i == cur_band && have_state ? 3 : 0);
@@ -787,8 +801,31 @@ static void handle_line(char *p)
 	if (!cmd)
 		return;
 
-	if (strcmp(cmd, "BANDS") == 0)
+	if (strcmp(cmd, "REGIONS") == 0)
 	{
+		nregions = (int)number(&p);
+		if (nregions < 0 || nregions > MAX_REGIONS)
+			nregions = nregions < 0 ? 0 : MAX_REGIONS;
+	}
+	else if (strcmp(cmd, "R") == 0)
+	{
+		int i = (int)number(&p);
+		if (i < 0 || i >= MAX_REGIONS)
+			return;
+		while (*p == ' ')
+			p++;
+		copy_word(regions[i], p, sizeof(regions[i]));
+	}
+	else if (strcmp(cmd, "REG") == 0)
+	{
+		cur_region = (int)number(&p);
+		if (cur_region < 0 || cur_region >= nregions)
+			cur_region = 0;
+		dirty |= D_BANDS;
+	}
+	else if (strcmp(cmd, "BANDS") == 0)
+	{
+		nactive = 0;	/* a new band list, perhaps for another region */
 		nbands = (int)number(&p);
 		if (nbands < 0 || nbands > MAX_BANDS)
 			nbands = nbands < 0 ? 0 : MAX_BANDS;
@@ -1075,6 +1112,12 @@ static void handle_gadget(struct Gadget *g, BOOL up)
 		queue_cmd(scan_dir ? "SCAN 0" : "SCAN 1");
 	else if (id == GID_SWEEP)
 		queue_cmd("SWEEP");
+	else if (id == GID_REGION && nregions > 1 && have_state)
+	{
+		char buf[16];
+		sprintf(buf, "REGION %d", (cur_region + 1) % nregions);
+		queue_cmd(buf);
+	}
 }
 
 static BOOL in_dial(int x, int y)
@@ -1326,7 +1369,7 @@ static BOOL open_window(void)
 	ox = win->BorderLeft;
 	oy = win->BorderTop;
 	init_gadgets();
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < NBUTTONS; i++)
 		AddGadget(win, &buttons[i], -1);
 	for (i = 0; i < 3; i++)
 		AddGadget(win, &sliders[i], -1);

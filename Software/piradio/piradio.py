@@ -13,6 +13,7 @@
 #
 # Amiga -> Pi:
 #   HELLO               send the band list and current state, start receiving
+#   REGION <i>          select region i (its band list)
 #   BAND <i>            select band i
 #   FREQ <hz>           tune (switches band if hz is outside the current one)
 #   SQL <level>         rtl_fm squelch level, 0 = off
@@ -23,6 +24,9 @@
 #   SWEEP               sweep the band again for active channels
 #
 # Pi -> Amiga:
+#   REGIONS <n>
+#   R <i> <name>
+#   REG <i>             the current region
 #   BANDS <n>
 #   B <i> <lo> <hi> <step> <mode> <short> <name>
 #   GAINS <n> <g0> <g1> ...
@@ -59,6 +63,7 @@ OUT_RATE = 18000                # sample rate piaudio plays at
 MAX_AUDIO_BUFFER = OUT_RATE     # bytes of 8-bit stereo, 0.5 s
 MAX_CHUNK = 200                 # largest MSG_DATA sent to the Amiga
 MAX_BANDS = 10                  # limits of the Amiga program
+MAX_REGIONS = 10
 MAX_GAINS = 40
 MAX_ACTIVE = 200
 MODES = ('wbfm', 'fm', 'am', 'usb', 'lsb', 'raw')
@@ -133,6 +138,20 @@ class Band(object):
         return self.lo <= freq <= self.hi
 
 
+def read_bands(region, band_list):
+    bands = []
+    if not isinstance(band_list, list):
+        band_list = []
+    for i, d in enumerate(band_list):
+        try:
+            bands.append(Band(d))
+        except (TypeError, ValueError, KeyError, AttributeError) as e:
+            logger.error('Ignoring band %d of %s in %s: %s', i + 1, region, CONFIG_FILE, e)
+    if len(bands) > MAX_BANDS:
+        logger.warning('Only the first %d bands of %s are used', MAX_BANDS, region)
+    return bands[:MAX_BANDS]
+
+
 def load_config():
     try:
         with open(CONFIG_FILE) as f:
@@ -160,18 +179,18 @@ def load_config():
         logger.error('Bad gains list in %s, using the default list', CONFIG_FILE)
         cfg['gains'] = DEFAULT_GAINS
 
-    bands = []
-    band_list = user.get('bands', [])
-    if not isinstance(band_list, list):
-        band_list = []
-    for i, d in enumerate(band_list):
-        try:
-            bands.append(Band(d))
-        except (TypeError, ValueError, KeyError, AttributeError) as e:
-            logger.error('Ignoring band %d in %s: %s', i + 1, CONFIG_FILE, e)
-    if len(bands) > MAX_BANDS:
-        logger.warning('Only the first %d bands are used', MAX_BANDS)
-    cfg['bands'] = bands[:MAX_BANDS] or [Band(DEFAULT_BAND)]
+    # "regions" maps a region name to its band list. A plain "bands" list
+    # (as in older configurations) is a single region.
+    regions = user.get('regions')
+    if not isinstance(regions, dict):
+        regions = {'Custom': user.get('bands', [])}
+    cfg['regions'] = []
+    for name, band_list in list(regions.items())[:MAX_REGIONS]:
+        bands = read_bands(str(name), band_list)
+        if bands:
+            cfg['regions'].append((str(name)[:30], bands))
+    if not cfg['regions']:
+        cfg['regions'] = [('Default', [Band(DEFAULT_BAND)])]
     return cfg
 
 
@@ -239,10 +258,13 @@ class Radio(object):
     def __init__(self, cfg, send):
         self.cfg = cfg
         self.send = send            # function that sends a line to the Amiga
-        self.bands = cfg['bands']
+        self.regions = cfg['regions']   # [(name, [Band])]
+        self.region = 0
+        self.bands = self.regions[0][1]
         self.band = 0
         self.freqs = {}             # band index -> frequency
         self.sqls = {}              # band index -> squelch level
+        self.saved = {}             # region name -> its band, freqs and sqls
         self.gain = -1
         self.vol = 8
         self.load_state()
@@ -299,32 +321,54 @@ class Radio(object):
         self.sqls[self.band] = max(0, min(999, level))
         self.state_changed = True
 
+    def set_region(self, i):
+        # Keeps where we were in this region, and goes back to where we
+        # were in the other one.
+        self.saved[self.regions[self.region][0]] = {
+            'band': self.band, 'freqs': self.freqs, 'sqls': self.sqls}
+        self.region = i
+        self.bands = self.regions[i][1]
+        self.band, self.freqs, self.sqls = 0, {}, {}
+        s = self.saved.get(self.regions[i][0])
+        if s:
+            try:
+                n = len(self.bands)
+                self.band = int(s['band']) if 0 <= int(s['band']) < n else 0
+                self.freqs = {int(k): self.bands[int(k)].snap(int(v))
+                    for k, v in s['freqs'].items() if 0 <= int(k) < n}
+                self.sqls = {int(k): int(v) for k, v in s['sqls'].items() if 0 <= int(k) < n}
+            except (TypeError, ValueError, KeyError, AttributeError) as e:
+                logger.warning('Ignoring the saved state of %s: %s', self.regions[i][0], e)
+        self.activity = {}
+        self.state_changed = True
+
     def load_state(self):
         try:
             with open(STATE_FILE) as f:
                 s = json.load(f)
-            self.band = int(s['band'])
-            if not 0 <= self.band < len(self.bands):
-                self.band = 0
-            self.freqs = {int(k): int(v) for k, v in s['freqs'].items()
-                if 0 <= int(k) < len(self.bands)}
-            for k in self.freqs:
-                self.freqs[k] = self.bands[k].snap(self.freqs[k])
-            self.sqls = {int(k): int(v) for k, v in s['sqls'].items()
-                if 0 <= int(k) < len(self.bands)}
             self.gain = int(s['gain'])
             self.vol = max(0, min(16, int(s['vol'])))
+            self.saved = dict(s.get('regions', {}))
+            names = [r[0] for r in self.regions]
+            if s.get('region') in names:
+                self.set_region(names.index(s['region']))
+            else:
+                self.set_region(0)
         except FileNotFoundError:
             pass
         except Exception as e:
             logger.warning('Ignoring %s: %s', STATE_FILE, e)
-            self.band, self.freqs, self.sqls, self.gain, self.vol = 0, {}, {}, -1, 8
+            self.gain, self.vol, self.saved = -1, 8, {}
+            self.set_region(0)
+        self.state_changed = False
         self.vol_table = volume_table(self.vol)
 
     def save_state(self):
         if not self.state_changed:
             return
-        s = {'band': self.band, 'freqs': self.freqs, 'sqls': self.sqls,
+        self.saved[self.regions[self.region][0]] = {
+            'band': self.band, 'freqs': self.freqs, 'sqls': self.sqls}
+        s = {'region': self.regions[self.region][0], 'regions': self.saved,
             'gain': self.gain, 'vol': self.vol}
         try:
             os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -338,6 +382,10 @@ class Radio(object):
     # ---- messages to the Amiga ----
 
     def send_info(self):
+        self.send('REGIONS %d' % len(self.regions))
+        for i, (name, bands) in enumerate(self.regions):
+            self.send('R %d %s' % (i, name))
+        self.send('REG %d' % self.region)
         self.send('BANDS %d' % len(self.bands))
         for i, b in enumerate(self.bands):
             self.send('B %d %d %d %d %s %s %s' % (i, b.lo, b.hi, b.step, b.mode, b.short, b.name))
@@ -652,13 +700,20 @@ class Radio(object):
             return
         band_before = self.band
 
-        if cmd in ('BAND', 'FREQ', 'SEEK', 'SCAN', 'SWEEP'):
+        if cmd in ('REGION', 'BAND', 'FREQ', 'SEEK', 'SCAN', 'SWEEP'):
             # The user wants something else: stop scanning and sweeping
             self.scan_dir = 0
             if self.sweep:
                 self.stop_sweep()
                 self.retune(now=True)
 
+        if cmd == 'REGION':
+            if 0 <= arg < len(self.regions) and arg != self.region:
+                self.set_region(arg)
+                self.send_info()
+                self.notify('REGION: ' + self.regions[arg][0].upper())
+                self.retune(now=True)
+            return
         if cmd == 'BAND':
             if 0 <= arg < len(self.bands) and arg != self.band:
                 self.band = arg
