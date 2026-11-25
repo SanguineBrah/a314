@@ -443,18 +443,26 @@ static void shutdown_spi()
         close(spi_fd);
 }
 
-static int check_spidev_bufsiz()
+// Returns 0 if the kernel module parameter in the file at path has the
+// given value, -1 if it can't be read, and -2 if it has another value.
+static int check_module_parameter(const char *path, const char *value)
 {
-    int fd = open("/sys/module/spidev/parameters/bufsiz", O_RDONLY);
+    int fd = open(path, O_RDONLY);
     if (fd == -1)
         return -1;
 
     char buf[32];
-    auto actual = read(fd, buf, strlen(buf));
+    auto actual = read(fd, buf, sizeof(buf) - 1);
 
     close(fd);
 
-    if (strncmp(buf, "65536", actual) != 0)
+    if (actual <= 0)
+        return -1;
+    buf[actual] = 0;
+
+    // The file holds the value followed by a newline
+    size_t len = strlen(value);
+    if (strncmp(buf, value, len) != 0 || (buf[len] != '\n' && buf[len] != 0))
         return -2;
 
     return 0;
@@ -1051,8 +1059,14 @@ static int init_driver()
     if (init_spi() != 0)
         return -1;
 
-    if (check_spidev_bufsiz())
+    if (check_module_parameter("/sys/module/spidev/parameters/bufsiz", "65536"))
         logger_warning("The spidev.bufsiz argument in /boot/cmdline.txt is set incorrectly, it should be 65536\n");
+
+    // With polling enabled, SPI reads of about 96 to 230 bytes can return
+    // stale data on recent kernels. Not every Pi uses spi_bcm2835, so only
+    // warn if the parameter is there and set to something else.
+    if (check_module_parameter("/sys/module/spi_bcm2835/parameters/polling_limit_us", "0") == -2)
+        logger_warning("The spi_bcm2835.polling_limit_us argument in /boot/cmdline.txt should be 0, or data read from the A314 can be corrupted\n");
 
     spi_proto_ver = spi_protocol_version();
 #elif defined(MODEL_FE) || defined(MODEL_CP)
