@@ -644,6 +644,12 @@ struct Gui *gui_open(const char *title, const struct GuiItem *items, int nitems,
 
 	if (gui->gt)
 	{
+		/* gadtools places gadgets from the window's outer corner */
+		for (i = 0; i < nitems; i++)
+		{
+			gui->items[i].px += bl;
+			gui->items[i].py += bt;
+		}
 		if (!gt_make_gadgets(gui))
 			goto fail;
 		gui->win = OpenWindowTags(NULL,
