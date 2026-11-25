@@ -29,6 +29,9 @@
 #define GUI_CYCLE	6	/* one of several choices */
 #define GUI_LIST	7	/* a scrolling list to choose from */
 #define GUI_LABEL	8	/* plain text, set with gui_set_text() */
+#define GUI_SLIDER	9	/* a level from 0 to max (set with gui_set_slider()) */
+#define GUI_AREA	10	/* a recessed box that the tool draws in (h: rows);
+				   clicks and drags in it are events */
 
 struct GuiItem
 {
@@ -59,6 +62,9 @@ struct GuiMenu
 #define GUI_EV_CLOSE	1	/* the close gadget, or Esc */
 #define GUI_EV_GADGET	2	/* id: the item; value: see gui_wait() */
 #define GUI_EV_MENU	3	/* id: the menu item */
+#define GUI_EV_KEY	4	/* value: a key that is no shortcut (its character) */
+#define GUI_EV_RAWKEY	5	/* value: the raw code of a cursor, function or Help
+				   key, and the qualifiers << 16 (2.0 and later) */
 
 struct GuiEvent
 {
@@ -77,7 +83,9 @@ void gui_close(struct Gui *gui);
 
 /* The signal to Wait() for, and the next event (FALSE when there are no
    more). value is the choice for a cycle gadget, the line for a list, 1 or
-   0 for a checkbox. */
+   0 for a checkbox, the level for a slider, and for an area the position
+   of the mouse in it, as x << 16 | y (while the button is held down, every
+   move is an event). */
 ULONG gui_signal(struct Gui *gui);
 BOOL gui_event(struct Gui *gui, struct GuiEvent *ev);
 
@@ -87,7 +95,12 @@ void gui_set_number(struct Gui *gui, UWORD id, LONG n);		/* INTEGER */
 void gui_set_check(struct Gui *gui, UWORD id, BOOL on);		/* CHECKBOX */
 void gui_set_cycle(struct Gui *gui, UWORD id, const char **labels, int n, int active);
 void gui_set_list(struct Gui *gui, UWORD id, const char **lines, int n, int selected);
+void gui_set_slider(struct Gui *gui, UWORD id, LONG level, LONG max);
 void gui_disable(struct Gui *gui, UWORD id, BOOL off);
+
+/* The inside of an AREA, in the window's coordinates, for drawing into
+   gui_window()->RPort */
+void gui_area(struct Gui *gui, UWORD id, int *x, int *y, int *w, int *h);
 
 /* Reading items */
 const char *gui_get_text(struct Gui *gui, UWORD id);		/* STRING */
