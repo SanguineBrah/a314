@@ -90,6 +90,7 @@ void tune_to(LONG f);
 void tune_steps(LONG n);
 void select_band(int i);
 void next_region(void);
+void select_region(int i);
 void do_seek(int dir);
 void toggle_scan(int dir);
 void do_sweep(void);
@@ -98,6 +99,7 @@ void set_sql(int s);
 int gain_index(void);		/* 0 = automatic, else 1 + the gain's index */
 void set_gain_index(int i);
 void handle_rawkey(UWORD code, UWORD qual, APTR prev);
+void handle_char(char c, UWORD qual);	/* a key as a character */
 void report(const char *text);
 
 /* Helpers */

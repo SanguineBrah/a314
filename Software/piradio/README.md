@@ -52,15 +52,15 @@ time.
 - Click or drag on the dial to tune, or turn the TUNING knob: drag it
   round, or click on its left or right side for one step. The marks under
   the scale are the active channels found by the last sweep.
-- The band keys select a band. (In the window, the line under a button
-  shows the current band.)
-- Drag the VOL, SQL and GAIN knobs up or down (in the window, the sliders).
+- The band keys select a band (in the window: the Band cycle gadget).
+- Drag the VOL, SQL and GAIN knobs up or down (in the window: the sliders).
 - SEEK goes to the next active channel down or up. SCAN steps through the
   active channels until it is pressed again. With the squelch off, it stays
   on each channel for `scan_dwell_seconds`. With the squelch on, it stays
   while there is a signal, and moves on after `scan_hang_seconds` of quiet.
 - REGION steps to the next region's band list (see Configuration). The
-  region is shown in the message strip (in the window, next to the meter).
+  region is shown in the message strip (in the window: the Region cycle
+  gadget, which also chooses a region directly).
 - HELP shows the keyboard shortcuts on the dial.
 - SWEEP looks for active channels again. Seek and scan sweep the band with
   `rtl_power` when there is no recent sweep, and scan sweeps again each

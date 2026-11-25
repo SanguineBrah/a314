@@ -632,16 +632,22 @@ void select_band(int i)
 	changed |= CH_BANDS | CH_DIAL | CH_FREQ;
 }
 
-void next_region(void)
+void select_region(int i)
 {
 	char buf[16];
 
-	if (nregions > 1 && can_tune())
+	if (i >= 0 && i < nregions && i != cur_region && can_tune())
 	{
-		sprintf(buf, "REGION %d", (cur_region + 1) % nregions);
+		sprintf(buf, "REGION %d", i);
 		queue_cmd(buf);
 		stop_scan_here();
 	}
+}
+
+void next_region(void)
+{
+	if (nregions > 1)
+		select_region((cur_region + 1) % nregions);
 }
 
 void do_seek(int dir)
@@ -772,7 +778,7 @@ static void commit_entry(void)
 	}
 }
 
-static void handle_char(char c, UWORD qual)
+void handle_char(char c, UWORD qual)
 {
 	if (entry_len >= 0)
 	{
