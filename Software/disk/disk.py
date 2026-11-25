@@ -65,6 +65,7 @@ class DiskService(object):
         self.mem_write_queue = []
 
     def load_config(self):
+        self.auto_insert = {}
         with open(CONF_FILE, 'rt') as f:
             j = json.load(f)
             for e in j.get('auto-insert', []):
@@ -228,6 +229,13 @@ class DiskService(object):
                 logger.info('Amiga connected to disk service')
                 self.current_stream_id = stream_id
                 self.a314d.send_connect_response(stream_id, 0)
+
+                # Again at each start of the Amiga, so that changes to the
+                # start-up images take effect then
+                try:
+                    self.load_config()
+                except Exception as e:
+                    logger.warning('Unable to read %s: %s', CONF_FILE, e)
 
                 for unit, (filename, writable) in self.auto_insert.items():
                     self.insert_adf(unit, filename, writable)
