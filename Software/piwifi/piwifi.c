@@ -14,6 +14,7 @@
 #include <graphics/text.h>
 #include <intuition/intuition.h>
 #include <intuition/screens.h>
+#include <workbench/startup.h>
 #include <libraries/dos.h>
 
 #include <proto/alib.h>
@@ -72,6 +73,9 @@ struct Network
 struct IntuitionBase *IntuitionBase = NULL;
 struct GfxBase *GfxBase = NULL;
 
+/* Set by the startup code when started from Workbench */
+extern struct WBStartup *_WBenchMsg;
+
 static struct TextAttr topaz8 = { (STRPTR)"topaz.font", 8, FS_NORMAL, FPF_ROMFONT };
 static struct TextFont *font = NULL;
 static struct Window *win = NULL;
@@ -105,6 +109,19 @@ static char cur_name[SSID_LEN + 1] = "";
 static int cur_signal = -1;
 static char msg[64] = "";
 static BOOL quit = FALSE;
+
+/* Shows a message in the shell, or in a requester when started from
+   Workbench (where there is no shell). */
+static void report(const char *text)
+{
+	struct IntuiText body = { 0, 1, JAM2, 16, 8, NULL, (UBYTE *)text, NULL };
+	struct IntuiText ok = { 0, 1, JAM2, 6, 3, NULL, (UBYTE *)"OK", NULL };
+
+	if (!_WBenchMsg || !IntuitionBase)
+		printf("%s\n", text);
+	else
+		AutoRequest(win, &body, NULL, &ok, 0, 0, 8 * strlen(text) + 48, 54);
+}
 
 /* ---------------------------------------------------------------------- */
 /* Gadgets                                                                */
@@ -794,7 +811,7 @@ int main(void)
 	}
 	if (!cmsg || !rmsg || !wmsg || !xmsg)
 	{
-		printf("Not enough memory\n");
+		report("Not enough memory");
 		rc = 20;
 		goto cleanup;
 	}
@@ -802,7 +819,7 @@ int main(void)
 	font = OpenFont(&topaz8);
 	if (!font || !open_window())
 	{
-		printf("Unable to open the window\n");
+		report("Unable to open the window");
 		rc = 20;
 		goto cleanup;
 	}
@@ -843,6 +860,7 @@ cleanup:
 	}
 	if (win)
 		CloseWindow(win);
+	win = NULL;
 	if (font)
 		CloseFont(font);
 	if (xmsg)

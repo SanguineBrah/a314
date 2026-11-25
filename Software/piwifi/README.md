@@ -15,7 +15,8 @@ can see, and connects to a network or forgets a saved one.
 
 ## Using PiWiFi
 
-Start `PiWiFi`. It asks the Pi for its connection and scans for networks,
+Copy *PiWiFi* and *PiWiFi.info* to a drawer and double-click the icon (or
+start `PiWiFi` from the shell). It asks the Pi for its connection and scans for networks,
 which takes a few seconds. In the list, `*` marks the network in use and
 `S` the networks the Pi has saved.
 
