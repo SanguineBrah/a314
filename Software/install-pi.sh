@@ -30,6 +30,7 @@ install_common() {
 	install pistats/pistats.py /opt/a314
 	install a314sh/a314shd.py /opt/a314
 	install mhi/mhi.py /opt/a314
+	install piserial/piserial.py /opt/a314
 	install a314sh/a314sh.py /usr/local/bin/a314sh
 
 	# Write configuration files, but don't overwrite
