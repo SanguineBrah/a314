@@ -20,6 +20,7 @@ install_common() {
 	install picmd/picmd.py /opt/a314
 	install a314fs/a314fs.py /opt/a314
 	install piaudio/piaudio.py /opt/a314
+	install piradio/piradio.py /opt/a314
 	install remotewb/remotewb.py /opt/a314
 	install disk/disk.py /opt/a314
 	install scsi/scsi.py /opt/a314
@@ -40,6 +41,7 @@ install_common() {
 	[ -f /etc/opt/a314/a314fs.conf ] || modinstall a314fs/a314fs.conf /etc/opt/a314
 	[ -f /etc/opt/a314/disk.conf ] || modinstall disk/disk.conf /etc/opt/a314
 	[ -f /etc/opt/a314/scsi.conf ] || modinstall scsi/scsi.conf /etc/opt/a314
+	[ -f /etc/opt/a314/piradio.conf ] || modinstall piradio/piradio.conf /etc/opt/a314
 
 	# Add shared directory for a314fs
 	sudo -u $A314_USER mkdir -p ${A314_HOME}/a314shared
