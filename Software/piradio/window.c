@@ -167,6 +167,81 @@ static void dial_label(char *buf, LONG f, LONG step)
 		sprintf(buf, "%ld.%03ld", f / 1000000L, (f % 1000000L) / 1000L);
 }
 
+/* Where the label of f goes: its left edge. A label too near an end of
+   the dial is moved inwards (*moved), and is then drawn only if there is
+   room for it. */
+static int label_x(struct RastPort *r, LONG f, LONG step, char *buf, int *w, BOOL *moved)
+{
+	int x;
+	dial_label(buf, f, step);
+	*w = TextLength(r, (STRPTR)buf, strlen(buf));
+	x = freq_to_x(f) - *w / 2;
+	*moved = TRUE;
+	if (x < 2)
+		x = 2;
+	else if (x + *w > dw - 2)
+		x = dw - 2 - *w;
+	else
+		*moved = FALSE;
+	return x;
+}
+
+/* Whether the labels of this step, but for those moved inwards, fit
+   without running into each other */
+static BOOL labels_fit(struct RastPort *r, struct Band *b, LONG step)
+{
+	char buf[16];
+	LONG f;
+	int x, w, last_end = -100;
+	BOOL moved;
+	for (f = (b->lo + step - 1) / step * step; f <= b->hi; f += step)
+	{
+		x = label_x(r, f, step, buf, &w, &moved);
+		if (moved)
+			continue;
+		if (x < last_end + 6)
+			return FALSE;
+		last_end = x + w;
+	}
+	return TRUE;
+}
+
+/* The labels: first those in place, then those at the ends that have
+   room */
+static void draw_labels(struct RastPort *r, int ox, int oy, struct Band *b, LONG step)
+{
+	char buf[16];
+	LONG f;
+	int pass, x, w, first = dw, last_end = -100;
+	BOOL moved;
+	SetAPen(r, 1);
+	for (pass = 0; pass < 2; pass++)
+		for (f = (b->lo + step - 1) / step * step; f <= b->hi; f += step)
+		{
+			x = label_x(r, f, step, buf, &w, &moved);
+			if (moved != (pass == 1))
+				continue;
+			if (moved)
+			{
+				if (x + w + 6 > first && x < last_end + 6)
+					continue;
+				/* The one at the other end must not meet this one */
+				if (x < first)
+					first = x;
+				else
+					last_end = x + w;
+			}
+			else
+			{
+				if (x < first)
+					first = x;
+				last_end = x + w;
+			}
+			Move(r, ox + x, oy + 2 + r->TxBaseline);
+			Text(r, (STRPTR)buf, strlen(buf));
+		}
+}
+
 static void dial_fill(struct RastPort *r, int pen, int ox, int oy, int x0, int y0, int x1, int y1)
 {
 	/* The off-screen dial has no clipping: keep inside it */
@@ -190,8 +265,7 @@ static void draw_dial(void)
 	int ox = have_dial_bm ? 0 : dx, oy = have_dial_bm ? 0 : dy;
 	struct Band *b = &bands[cur_band];
 	LONG step, minor, f;
-	char buf[16];
-	int i, x, n, w, last_end = -100;
+	int i, x;
 
 	SetDrMd(r, JAM1);
 	dial_fill(r, 0, ox, oy, 0, 0, dw - 1, dh - 1);
@@ -201,17 +275,9 @@ static void draw_dial(void)
 		int base = dh - 4;
 		/* The scale: long ticks with labels, short ticks between them */
 		step = label_step(b->hi - b->lo);
-		/* Fewer labels where they would not all fit. Each needs its own
-		   width and a gap, and half a width more: the labels at the ends
-		   are moved inwards to stay on the dial. */
-		for (;;)
-		{
-			dial_label(buf, b->hi, step);
-			w = TextLength(r, (STRPTR)buf, strlen(buf));
-			if (step >= b->hi - b->lo || ((b->hi - b->lo) / step) * (w + w / 2 + 8) <= dw - 4)
-				break;
+		/* Fewer labels where they would not all fit */
+		while (step < b->hi - b->lo && !labels_fit(r, b, step))
 			step = next_step(step);
-		}
 		minor = step >= 5 ? step / 5 : step;
 		for (f = (b->lo + minor - 1) / minor * minor; f <= b->hi; f += minor)
 		{
@@ -222,23 +288,9 @@ static void draw_dial(void)
 				continue;
 			}
 			dial_fill(r, 1, ox, oy, x, base - 7, x, base);
-			dial_label(buf, f, step);
-			n = strlen(buf);
-			w = TextLength(r, (STRPTR)buf, n);
-			x -= w / 2;
-			if (x < 2)
-				x = 2;
-			if (x + w > dw - 2)
-				x = dw - 2 - w;
-			/* A label that would run into the one before is left out */
-			if (2 + r->TxHeight < base - 8 && x >= 0 && x >= last_end + 6)
-			{
-				last_end = x + w;
-				SetAPen(r, 1);
-				Move(r, ox + x, oy + 2 + r->TxBaseline);
-				Text(r, (STRPTR)buf, n);
-			}
 		}
+		if (2 + r->TxHeight < base - 8)
+			draw_labels(r, ox, oy, b, step);
 		dial_fill(r, 1, ox, oy, 3, base, dw - 4, base);
 
 		/* Active channels found by the last sweep */
