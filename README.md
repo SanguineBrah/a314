@@ -57,6 +57,8 @@ You may also launch Interactive applications using the pi command, such as `pi m
 - [*PiRadio*](Software/piradio) turns an RTL-SDR dongle plugged into the RPi into a radio that is tuned from a window on the Workbench, with the sound played through PiAudio. It can sweep a band for active channels, and seek or scan between them.
 - [*A314 datatypes*](Software/datatypes) let programs that use datatypes, such as MultiView, show WebP, AVIF, HEIC, JPEG XL and TIFF pictures and play MP3, FLAC and Ogg sounds, decoded by the RPi.
 
+- [*PiWiFi*](Software/piwifi) (WiFi in Prefs/A314) lets you choose the WiFi network the RPi connects to from the Workbench. A change that leaves the RPi without network access is undone automatically.
+
 - [*RemoteWB*](Software/remotewb) works by moving the Workbench bitplanes over to the chip memory on the A314. This requires that the A500 has at least a 8372 Agnus. During drawing of each frame on the Amiga, the RPi reads those bitplanes, encodes them into a [GIF image](Software/bpls2gif), and transmits that image to a web browser through a web socket. The web browser in turn, returns key presses and mouse movements back to the Amiga through the same web socket. In effect, this becomes a web browser based remote control application, comparable to VNC but with near zero performance impact on the Amiga CPU!
 
 - [*VideoPlayer*](Software/videoplayer) is a simple program that displays a sequence of images on the A500 by letting the RPi write bitplanes directly to the shared memory (this again requires that the A314 memory is chip memory, and not "ranger" memory).

@@ -141,3 +141,8 @@ all: ${BIN}/Prefs/A314/Pictures
 ${BIN}/Prefs/A314/Pictures: datatypes/picturesprefs.c prefs/a314gui.c prefs/a314gui.h datatypes/Pictures.info ${BIN}/Prefs/A314.info
 	${VC} datatypes/picturesprefs.c prefs/a314gui.c -lamiga -o ${BIN}/Prefs/A314/Pictures
 	cp datatypes/Pictures.info ${BIN}/Prefs/A314/Pictures.info
+
+all: ${BIN}/Prefs/A314/WiFi
+${BIN}/Prefs/A314/WiFi: a314device/a314.h piwifi/piwifi.c prefs/a314gui.c prefs/a314gui.h piwifi/WiFi.info ${BIN}/Prefs/A314.info
+	${VC} piwifi/piwifi.c prefs/a314gui.c -lamiga -o ${BIN}/Prefs/A314/WiFi
+	cp piwifi/WiFi.info ${BIN}/Prefs/A314/WiFi.info
