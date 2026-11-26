@@ -4,6 +4,7 @@
 #include <libraries/dos.h>
 
 #include <devices/audio.h>
+#include <devices/timer.h>
 #include <intuition/intuition.h>
 #include <workbench/startup.h>
 #include <workbench/workbench.h>
@@ -38,6 +39,25 @@
 
 #define LEFT 0
 #define RIGHT 1
+
+/*
+ * PiAudio uses the sound hardware (two Paula channels, or the AHI unit)
+ * only while the Pi plays something. After IDLE_BLOCKS blocks of silence
+ * it lets go of it, so that other programs (e.g. a module player) can use
+ * it, and a timer then paces the blocks from the Pi instead. The first
+ * block with sound in it takes the hardware back, if it is free; if
+ * another program has it, the Pi's sound is left out until it is free.
+ * PiAudio also never takes Paula channels from another program: it asks
+ * for them below the usual priority, and gives them up when a program
+ * with a higher priority takes them.
+ */
+#define IDLE_BLOCKS	40	/* 2 seconds */
+#define SILENCE		2	/* samples this close to 0 are silence */
+#define PAULA_PRI	-50	/* precedence of PiAudio's channel allocation */
+
+#define HW_OFF		0	/* no sound hardware; the timer paces the blocks */
+#define HW_ON		1	/* playing */
+#define HW_DRAINING	2	/* letting go: no new requests, the timer paces */
 
 /*
  * Optional AHI output (piaudio AHI). AHI mixes PiAudio with other
@@ -86,6 +106,15 @@ extern struct WBStartup *_WBenchMsg;
 
 #define PORT_NAME "PiAudio"	/* marks that PiAudio is running */
 struct MsgPort *marker_port = NULL;
+
+struct timerequest *timer_req = NULL;
+BOOL timer_device_open = FALSE;
+BOOL timer_pending = FALSE;
+
+int hw_state = HW_OFF;
+int silent_blocks = 0;
+int pending_audio_reqs = 0;
+BOOL hw_lost = FALSE;		/* a channel was taken by another program */
 
 BOOL use_ahi = FALSE;
 BOOL ahi_device_open = FALSE;
@@ -258,8 +287,8 @@ void submit_ahi_req(int index)
 	ahi_pending[slot] = TRUE;
 }
 
-/* Allocates a left and a right Paula channel through audio.device */
-BOOL open_paula()
+/* Creates the audio.device requests; acquire_paula() then allocates */
+BOOL create_paula()
 {
 	int i;
 
@@ -279,11 +308,19 @@ BOOL open_paula()
 			return FALSE;
 		}
 	}
+	return TRUE;
+}
 
-	UBYTE which_channels[] = { L0 | R0, L0 | R1, L1 | R0, L1 | R1 };
+/* Allocates a left and a right Paula channel through audio.device, if
+   they are free (it doesn't wait, and takes no channel from a program
+   with the usual priority or higher) */
+BOOL acquire_paula()
+{
+	static UBYTE which_channels[] = { L0 | R0, L0 | R1, L1 | R0, L1 | R1 };
+	int i;
 
 	sync_audio_req->ioa_Request.io_Message.mn_ReplyPort = sync_mp;
-	sync_audio_req->ioa_Request.io_Message.mn_Node.ln_Pri = 127;
+	sync_audio_req->ioa_Request.io_Message.mn_Node.ln_Pri = PAULA_PRI;
 	sync_audio_req->ioa_Request.io_Command = ADCMD_ALLOCATE;
 	sync_audio_req->ioa_Request.io_Flags = ADIOF_NOWAIT;
 	sync_audio_req->ioa_AllocKey = 0;
@@ -291,10 +328,7 @@ BOOL open_paula()
 	sync_audio_req->ioa_Length = sizeof(which_channels);
 
 	if (OpenDevice(AUDIONAME, 0, (struct IORequest *)sync_audio_req, 0))
-	{
-		report("Unable to open audio.device");
 		return FALSE;
-	}
 
 	audio_device_open = TRUE;
 
@@ -306,8 +340,8 @@ BOOL open_paula()
 	return TRUE;
 }
 
-/* Opens ahi.device instead of allocating Paula channels */
-BOOL open_ahi()
+/* Creates the AHI requests; acquire_ahi() then opens ahi.device */
+BOOL create_ahi()
 {
 	int i;
 
@@ -322,15 +356,119 @@ BOOL open_ahi()
 		}
 	}
 
+	return TRUE;
+}
+
+/* Opens ahi.device (instead of allocating Paula channels) */
+BOOL acquire_ahi()
+{
 	ahi_req[0]->ahir_Version = 4;
 	if (OpenDevice(AHINAME, AHI_DEFAULT_UNIT, (struct IORequest *)ahi_req[0], 0))
-	{
-		report("Unable to open ahi.device (AHI needs Kickstart 2.04 or later)");
 		return FALSE;
-	}
 	ahi_device_open = TRUE;
 	memcpy(ahi_req[1], ahi_req[0], sizeof(struct AHIRequest));
 	return TRUE;
+}
+
+/* Requests per buffer: one for AHI, a left and a right one for Paula */
+int reqs_per_buffer()
+{
+	return use_ahi ? 1 : 2;
+}
+
+/* Lets go of the sound hardware; there must be no requests left */
+void release_hw()
+{
+	if (ahi_device_open)
+	{
+		CloseDevice((struct IORequest *)ahi_req[0]);
+		ahi_device_open = FALSE;
+	}
+	if (audio_device_open)
+	{
+		CloseDevice((struct IORequest *)sync_audio_req);
+		audio_device_open = FALSE;
+	}
+	hw_state = HW_OFF;
+	hw_lost = FALSE;
+}
+
+/* Whether buffer index (0 or 2, both channels) is silent */
+BOOL is_silent(int index)
+{
+	BYTE *p = (BYTE *)audio_buffers[index];
+	int i;
+	for (i = 0; i < SAMPLES * 2; i++)
+		if (p[i] > SILENCE || p[i] < -SILENCE)
+			return FALSE;
+	return TRUE;
+}
+
+/* Plays buffer index (0 or 2) on the sound hardware */
+void play_block(int index)
+{
+	if (use_ahi)
+	{
+		submit_ahi_req(index);
+		pending_audio_reqs++;
+	}
+	else if (pending_audio_reqs == 0)
+	{
+		/* Start both channels together, so that they stay in step */
+		sync_audio_req->ioa_Request.io_Command = CMD_STOP;
+		DoIO((struct IORequest *)sync_audio_req);
+		submit_async_audio_req(index + LEFT);
+		submit_async_audio_req(index + RIGHT);
+		sync_audio_req->ioa_Request.io_Command = CMD_START;
+		DoIO((struct IORequest *)sync_audio_req);
+		pending_audio_reqs += 2;
+	}
+	else
+	{
+		submit_async_audio_req(index + LEFT);
+		submit_async_audio_req(index + RIGHT);
+		pending_audio_reqs += 2;
+	}
+}
+
+/* The next block in one block's time, while the hardware isn't playing */
+void start_timer()
+{
+	timer_req->tr_node.io_Message.mn_ReplyPort = async_mp;
+	timer_req->tr_node.io_Command = TR_ADDREQUEST;
+	timer_req->tr_time.tv_secs = 0;
+	timer_req->tr_time.tv_micro = BUFFER_LEN_MS * 1000;
+	SendIO((struct IORequest *)timer_req);
+	timer_pending = TRUE;
+}
+
+/* A block from the Pi is in buffer index: play it, or not, and decide
+   whether to take or let go of the sound hardware */
+void handle_block(int index)
+{
+	BOOL silent = is_silent(index);
+
+	silent_blocks = silent ? silent_blocks + 1 : 0;
+
+	if (hw_state == HW_ON && (hw_lost || silent_blocks >= IDLE_BLOCKS))
+		hw_state = HW_DRAINING;		/* let go, once the requests are back */
+
+	if (hw_state == HW_DRAINING && !silent && !hw_lost)
+		hw_state = HW_ON;		/* still open: carry on */
+
+	if (hw_state == HW_OFF && !silent)
+	{
+		if (use_ahi ? acquire_ahi() : acquire_paula())
+			hw_state = HW_ON;
+	}
+
+	if (hw_state == HW_ON)
+		play_block(index);
+	else if (!timer_pending)
+		start_timer();
+
+	if (hw_state == HW_DRAINING && pending_audio_reqs == 0)
+		release_hw();
 }
 
 int main(int argc, char **argv)
@@ -443,8 +581,31 @@ int main(int argc, char **argv)
 
 	int i;
 
-	if (use_ahi ? !open_ahi() : !open_paula())
+	if (use_ahi ? !create_ahi() : !create_paula())
 		goto cleanup;
+
+	timer_req = (struct timerequest *)CreateExtIO(async_mp, sizeof(struct timerequest));
+	if (!timer_req || OpenDevice(TIMERNAME, UNIT_MICROHZ, (struct IORequest *)timer_req, 0))
+	{
+		report("Unable to open timer.device");
+		goto cleanup;
+	}
+	timer_device_open = TRUE;
+
+	/* Take the hardware now, so that a missing AHI is reported; with
+	   Paula, the channels may be in use, which is fine: PiAudio takes them
+	   when they are free and the Pi plays something. */
+	if (use_ahi)
+	{
+		if (!acquire_ahi())
+		{
+			report("Unable to open ahi.device (AHI needs Kickstart 2.04 or later)");
+			goto cleanup;
+		}
+		hw_state = HW_ON;
+	}
+	else if (acquire_paula())
+		hw_state = HW_ON;
 
 	if (a314_connect(SERVICE_NAME) != A314_CONNECT_OK)
 	{
@@ -472,43 +633,36 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* Requests per buffer: one for AHI, a left and a right one for Paula */
-	int reqs_per_buffer = use_ahi ? 1 : 2;
-
-	if (use_ahi)
+	if (!_WBenchMsg)
 	{
-		if (!_WBenchMsg)
+		if (use_ahi)
 			printf("PiAudio started, playing through AHI\n");
-		submit_ahi_req(back_index);
-	}
-	else
-	{
-		if (!_WBenchMsg)
+		else if (hw_state == HW_ON)
 			printf("PiAudio started, allocated channels: L%d, R%d\n",
 				(allocated_channels & LEFT_CHAN_MASK) == L0 ? 0 : 1,
 				(allocated_channels & RIGHT_CHAN_MASK) == R0 ? 0 : 1);
-
-		sync_audio_req->ioa_Request.io_Command = CMD_STOP;
-		DoIO((struct IORequest *)sync_audio_req);
-
-		submit_async_audio_req(back_index + LEFT);
-		submit_async_audio_req(back_index + RIGHT);
-
-		sync_audio_req->ioa_Request.io_Command = CMD_START;
-		DoIO((struct IORequest *)sync_audio_req);
+		else
+			printf("PiAudio started; the sound channels are in use, it plays when they are free\n");
 	}
 
-	int pending_audio_reqs = reqs_per_buffer;
+	if (hw_state == HW_ON)
+		play_block(back_index);
+	else
+		start_timer();
 
 	ULONG portsig = 1L << async_mp->mp_SigBit;
+	BOOL next_block = hw_state == HW_ON;
 
 	if (!_WBenchMsg)
 		printf("Press ctrl-c to exit...\n");
 
 	while (TRUE)
 	{
-		if (pending_audio_reqs <= reqs_per_buffer)
+		/* The next block is wanted when the hardware has only one block
+		   left to play, or (when it isn't playing) when the timer says */
+		while (next_block)
 		{
+			next_block = FALSE;
 			back_index ^= 2;
 
 			if (!has_a314_chip_memory)
@@ -518,21 +672,17 @@ int main(int argc, char **argv)
 				ReadMemA314(dst, address, SAMPLES * 2);
 			}
 
-			if (use_ahi)
-				submit_ahi_req(back_index);
-			else
-			{
-				submit_async_audio_req(back_index + LEFT);
-				submit_async_audio_req(back_index + RIGHT);
-			}
-
-			pending_audio_reqs += reqs_per_buffer;
+			handle_block(back_index);
 
 			if (!pending_a314_write)
 			{
 				awbuf[0] = back_index == 0 ? 0 : 1;
 				start_a314_write(awbuf, 1);
 			}
+
+			/* Keep two blocks queued while playing, so there is no gap */
+			if (hw_state == HW_ON && pending_audio_reqs <= reqs_per_buffer())
+				next_block = TRUE;
 		}
 
 		ULONG signal = Wait(SIGBREAKF_CTRL_C | portsig);
@@ -551,13 +701,36 @@ int main(int argc, char **argv)
 					else
 						goto cleanup;
 				}
+				else if (msg == (struct Message *)timer_req)
+				{
+					timer_pending = FALSE;
+					if (hw_state != HW_ON)
+						next_block = TRUE;
+				}
 				else
 				{
 					if (msg == (struct Message *)ahi_req[0])
 						ahi_pending[0] = FALSE;
 					else if (msg == (struct Message *)ahi_req[1])
 						ahi_pending[1] = FALSE;
+					else if (((struct IOAudio *)msg)->ioa_Request.io_Error == ADIOERR_NOALLOCATION ||
+						((struct IOAudio *)msg)->ioa_Request.io_Error == ADIOERR_CHANNELSTOLEN)
+						hw_lost = TRUE;	/* another program took the channels */
 					pending_audio_reqs--;
+
+					if (hw_state == HW_ON)
+					{
+						if (hw_lost)
+							hw_state = HW_DRAINING;
+						else if (pending_audio_reqs <= reqs_per_buffer())
+							next_block = TRUE;
+					}
+					if (hw_state == HW_DRAINING && pending_audio_reqs == 0)
+					{
+						release_hw();
+						if (!timer_pending)
+							start_timer();
+					}
 				}
 			}
 		}
@@ -566,6 +739,15 @@ int main(int argc, char **argv)
 cleanup:
 	if (stream_open)
 		a314_reset();
+	if (timer_pending)
+	{
+		AbortIO((struct IORequest *)timer_req);
+		WaitIO((struct IORequest *)timer_req);
+	}
+	if (timer_device_open)
+		CloseDevice((struct IORequest *)timer_req);
+	if (timer_req)
+		DeleteExtIO((struct IORequest *)timer_req);
 	for (i = 0; i < 2; i++)
 	{
 		if (ahi_pending[i])
