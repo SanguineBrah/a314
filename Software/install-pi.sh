@@ -34,6 +34,7 @@ install_common() {
 	install piserial/piserial.py /opt/a314
 	install prefs/a314prefs.py /opt/a314
 	install datatypes/datatypes.py /opt/a314
+	install usb/a314usb.py /opt/a314
 	install a314sh/a314sh.py /usr/local/bin/a314sh
 
 	# Write configuration files, but don't overwrite
@@ -46,6 +47,9 @@ install_common() {
 	# which runs as the A314 user)
 	chown ${A314_USER}:${A314_GROUP} /etc/opt/a314/disk.conf /etc/opt/a314/scsi.conf
 	[ -f /etc/opt/a314/piradio.conf ] || modinstall piradio/piradio.conf /etc/opt/a314
+
+	# Let the A314 user mount USB sticks (for the a314usb service)
+	modinstall usb/50-a314usb.rules /etc/polkit-1/rules.d
 
 	# Add shared directory for a314fs
 	sudo -u $A314_USER mkdir -p ${A314_HOME}/a314shared

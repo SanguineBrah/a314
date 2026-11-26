@@ -38,6 +38,18 @@ ${BIN}/Devs/DOSDrivers/PD0: disk/DOSDrivers/PD0 disk/DOSDrivers/PD1 disk/DOSDriv
 	mkdir -p ${BIN}/Devs/DOSDrivers
 	cp disk/DOSDrivers/PD? disk/DOSDrivers/PD?.info ${BIN}/Devs/DOSDrivers/
 
+all: ${BIN}/L/a314usb ${BIN}/Devs/DOSDrivers/USB0
+${BIN}/L/a314usb: a314device/a314.h a314device/proto_a314.h a314fs/messages.h usb/a314usb.c a314fs/bcpl_start.asm a314fs/bcpl_end.asm
+	${VC} usb/a314usb.c -S -o ${BIN}/L/a314usb.asm
+	sed -i 's/section/;section/g' ${BIN}/L/a314usb.asm
+	${VC} a314fs/bcpl_start.asm ${BIN}/L/a314usb.asm a314fs/bcpl_end.asm -nostdlib -o ${BIN}/L/a314usb
+	dd if=${BIN}/L/a314usb bs=1 skip=28 count=4 of=${BIN}/L/a314usb seek=32 conv=notrunc
+	rm ${BIN}/L/a314usb.asm
+
+${BIN}/Devs/DOSDrivers/USB0: usb/DOSDrivers/USB0 usb/DOSDrivers/USB1 usb/DOSDrivers/USB2 usb/DOSDrivers/USB3
+	mkdir -p ${BIN}/Devs/DOSDrivers
+	cp usb/DOSDrivers/USB? usb/DOSDrivers/USB?.info ${BIN}/Devs/DOSDrivers/
+
 ${BIN}/Devs/MountList: a314fs/a314fs-mountlist disk/Mountlist
 	cat a314fs/a314fs-mountlist disk/Mountlist > ${BIN}/Devs/MountList
 

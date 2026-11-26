@@ -1,0 +1,18 @@
+/* USB0:, a drive for USB memory sticks plugged into the Raspberry Pi
+   (L:a314usb, and the a314usb service on the Pi). Sticks take the drives
+   USB0: to USB3: in the order they are plugged in. Copy this file and its
+   icon to DEVS:DOSDrivers to have the drive at every start, or
+   double-click the icon to mount it now. */
+FileSystem     = L:a314usb
+Device         = a314.device
+Unit           = 0
+Flags          = 0
+Surfaces       = 1
+BlocksPerTrack = 10
+Reserved       = 2
+LowCyl         = 0
+HighCyl        = 100
+StackSize      = 4096
+DosType        = 0x33313400
+Mount          = 1
+#
