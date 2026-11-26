@@ -649,7 +649,7 @@ class UsbService(object):
     def find_sticks(self):
         # {uuid: (device, fstype, label, mountpoint or None, read-only)}
         try:
-            out = subprocess.run(['lsblk', '-J', '-o', 'PATH,PKNAME,NAME,FSTYPE,LABEL,UUID,MOUNTPOINTS,TRAN,TYPE,RO'],
+            out = subprocess.run(['lsblk', '-J', '-l', '-o', 'PATH,PKNAME,NAME,FSTYPE,LABEL,UUID,MOUNTPOINTS,TRAN,TYPE,RO'],
                                  capture_output=True, text=True, timeout=10).stdout
             devs = json.loads(out).get('blockdevices', [])
         except (OSError, ValueError, subprocess.SubprocessError) as e:
