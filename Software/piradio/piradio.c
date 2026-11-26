@@ -109,6 +109,8 @@ static struct A314_IORequest *cmsg = NULL, *rmsg = NULL, *wmsg = NULL, *xmsg = N
 static BOOL a314_open = FALSE;
 static BOOL pending_connect = FALSE, pending_read = FALSE;
 static BOOL pending_write = FALSE, pending_reset = FALSE;
+static BOOL write_has_values = FALSE;	/* the write in flight changes the
+					   frequency, squelch, gain or volume */
 static ULONG socket;
 static int socket_seq = 0;
 int conn_state = CS_DOWN;
@@ -257,6 +259,7 @@ static void send_pending(void)
 		len += sprintf((char *)awbuf + len, "GAIN %d\n", gain);
 	if (out_dirty & OUT_VOL)
 		len += sprintf((char *)awbuf + len, "VOL %d\n", vol);
+	write_has_values = out_dirty != 0;
 	out_dirty = 0;
 
 	start_a314_cmd(wmsg, A314_WRITE, (char *)awbuf, len);
@@ -322,7 +325,10 @@ static void handle_state(char *p)
 		awaiting_band = FALSE;
 		new_band = TRUE;
 	}
-	if (new_band || (hold_ticks == 0 && !out_dirty && !pending_write && cmdq_len == 0 && !ui_dragging))
+	/* (A write in flight that only asks for something, like SEEK, doesn't
+	   count: the Pi's answer can arrive before the write is done.) */
+	if (new_band || (hold_ticks == 0 && !out_dirty && !(pending_write && write_has_values) &&
+		cmdq_len == 0 && !ui_dragging))
 	{
 		s = s < 0 ? 0 : s > SQL_MAX ? SQL_MAX : s;
 		g = g < -1 ? -1 : g;

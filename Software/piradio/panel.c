@@ -1113,7 +1113,9 @@ static void mouse_down(int mx, int my, UWORD qual)
 			press_button(i, qual);
 		}
 	}
-	ui_dragging = drag_mode != DRAG_NONE;
+	/* Only dragging the dial or a knob holds off the Pi's state (a button
+	   is held down for a moment too, while the Pi answers it) */
+	ui_dragging = drag_mode == DRAG_DIAL || drag_mode == DRAG_TUNE || drag_mode == DRAG_KNOB;
 }
 
 static void mouse_move(int mx, int my)
