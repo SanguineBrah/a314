@@ -40,6 +40,7 @@ class Drive(object):
     def __init__(self, unit: int):
         self.unit = unit
         self.f: Optional[io.BufferedRandom] = None
+        self.filename: Optional[str] = None
         self.writable = False
         self.geometry: Optional[Tuple[int, int, int]] = None
         self.geometry_sent = False
@@ -49,6 +50,9 @@ class DiskService(object):
         self.a314d = A314d(SERVICE_NAME)
 
         self.control_server_socket = socket.socket()
+        # So that the service can start again straight away, while earlier
+        # control connections are still in TIME_WAIT
+        self.control_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.control_server_socket.bind(('localhost', 23890))
         self.control_server_socket.listen(10)
 
@@ -61,6 +65,7 @@ class DiskService(object):
         self.mem_write_queue = []
 
     def load_config(self):
+        self.auto_insert = {}
         with open(CONF_FILE, 'rt') as f:
             j = json.load(f)
             for e in j.get('auto-insert', []):
@@ -76,6 +81,7 @@ class DiskService(object):
 
         drive.f.close()
         drive.f = None
+        drive.filename = None
 
         if self.current_stream_id is not None:
             self.a314d.send_data(self.current_stream_id, struct.pack('>BB', EJECT_NOTIFY, unit))
@@ -111,6 +117,7 @@ class DiskService(object):
             return "Failed: A disk with a different geometry was previously inserted"
 
         drive.f = f
+        drive.filename = filename
         drive.writable = writable
         drive.geometry = geometry
 
@@ -223,6 +230,13 @@ class DiskService(object):
                 self.current_stream_id = stream_id
                 self.a314d.send_connect_response(stream_id, 0)
 
+                # Again at each start of the Amiga, so that changes to the
+                # start-up images take effect then
+                try:
+                    self.load_config()
+                except Exception as e:
+                    logger.warning('Unable to read %s: %s', CONF_FILE, e)
+
                 for unit, (filename, writable) in self.auto_insert.items():
                     self.insert_adf(unit, filename, writable)
             else:
@@ -277,6 +291,11 @@ class DiskService(object):
             if cmd == 'eject':
                 unit = int(arr[1])
                 res = self.eject_adf(unit)
+            elif cmd == 'status':
+                # One line per drive: unit, rw/ro (or - if empty), file
+                res = '\n'.join('%d %s %s' % (d.unit,
+                    ('rw' if d.writable else 'ro') if d.f else '-', d.filename or '')
+                    for d in self.drives)
             elif cmd == 'insert':
                 unit = int(arr[1])
                 rw = arr[2] == '-rw'

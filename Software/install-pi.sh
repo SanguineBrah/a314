@@ -32,6 +32,7 @@ install_common() {
 	install a314sh/a314shd.py /opt/a314
 	install mhi/mhi.py /opt/a314
 	install piserial/piserial.py /opt/a314
+	install prefs/a314prefs.py /opt/a314
 	install datatypes/datatypes.py /opt/a314
 	install a314sh/a314sh.py /usr/local/bin/a314sh
 
@@ -41,6 +42,9 @@ install_common() {
 	[ -f /etc/opt/a314/a314fs.conf ] || modinstall a314fs/a314fs.conf /etc/opt/a314
 	[ -f /etc/opt/a314/disk.conf ] || modinstall disk/disk.conf /etc/opt/a314
 	[ -f /etc/opt/a314/scsi.conf ] || modinstall scsi/scsi.conf /etc/opt/a314
+	# The Disks tool in Prefs/A314 changes these (through a314prefs.py,
+	# which runs as the A314 user)
+	chown ${A314_USER}:${A314_GROUP} /etc/opt/a314/disk.conf /etc/opt/a314/scsi.conf
 	[ -f /etc/opt/a314/piradio.conf ] || modinstall piradio/piradio.conf /etc/opt/a314
 
 	# Add shared directory for a314fs

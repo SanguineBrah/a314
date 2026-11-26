@@ -103,6 +103,10 @@ class ScsiService(object):
         self.mem_read_queue = []    # (stream_id, unit, cdb)
 
     def load_config(self):
+        for img in self.images.values():
+            if img.f:
+                img.f.close()
+        self.images = {}
         try:
             with open(CONF_FILE, 'rt') as f:
                 j = json.load(f)
@@ -251,6 +255,9 @@ class ScsiService(object):
         if ptype == self.a314d.MSG_CONNECT:
             if payload == SERVICE_NAME.encode() and self.current_stream_id is None:
                 logger.info('Amiga connected to scsi service')
+                # Again at each start of the Amiga, so that changes to the
+                # units take effect then
+                self.load_config()
                 self.current_stream_id = stream_id
                 self.a314d.send_connect_response(stream_id, 0)
             else:
