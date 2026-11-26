@@ -125,7 +125,7 @@ static LONG x_to_freq(int x)
 	return b->lo + (span / w) * x + ((span % w) * x) / w;
 }
 
-/* A step between labelled ticks that gives about 8 labels */
+/* A step between labelled ticks that gives at most 10 labels */
 static LONG label_step(LONG span)
 {
 	LONG s = 1;
@@ -139,6 +139,32 @@ static LONG label_step(LONG span)
 			return s * 5;
 		s *= 10;
 	}
+}
+
+/* The next step of 1, 2, 5, 10, 20, 50, ... */
+static LONG next_step(LONG s)
+{
+	LONG p = 1;
+	while (s / p >= 10)
+		p *= 10;
+	if (s / p == 1)
+		return 2 * p;
+	if (s / p == 2)
+		return 5 * p;
+	return 10 * p;
+}
+
+/* The label of frequency f, with as many decimals as the step needs */
+static void dial_label(char *buf, LONG f, LONG step)
+{
+	if (step >= 1000000L)
+		sprintf(buf, "%ld", f / 1000000L);
+	else if (step >= 100000L)
+		sprintf(buf, "%ld.%ld", f / 1000000L, (f % 1000000L) / 100000L);
+	else if (step >= 10000L)
+		sprintf(buf, "%ld.%02ld", f / 1000000L, (f % 1000000L) / 10000L);
+	else
+		sprintf(buf, "%ld.%03ld", f / 1000000L, (f % 1000000L) / 1000L);
 }
 
 static void dial_fill(struct RastPort *r, int pen, int ox, int oy, int x0, int y0, int x1, int y1)
@@ -175,6 +201,17 @@ static void draw_dial(void)
 		int base = dh - 4;
 		/* The scale: long ticks with labels, short ticks between them */
 		step = label_step(b->hi - b->lo);
+		/* Fewer labels where they would not all fit. Each needs its own
+		   width and a gap, and half a width more: the labels at the ends
+		   are moved inwards to stay on the dial. */
+		for (;;)
+		{
+			dial_label(buf, b->hi, step);
+			w = TextLength(r, (STRPTR)buf, strlen(buf));
+			if (step >= b->hi - b->lo || ((b->hi - b->lo) / step) * (w + w / 2 + 8) <= dw - 4)
+				break;
+			step = next_step(step);
+		}
 		minor = step >= 5 ? step / 5 : step;
 		for (f = (b->lo + minor - 1) / minor * minor; f <= b->hi; f += minor)
 		{
@@ -185,14 +222,7 @@ static void draw_dial(void)
 				continue;
 			}
 			dial_fill(r, 1, ox, oy, x, base - 7, x, base);
-			if (step >= 1000000L)
-				sprintf(buf, "%ld", f / 1000000L);
-			else if (step >= 100000L)
-				sprintf(buf, "%ld.%ld", f / 1000000L, (f % 1000000L) / 100000L);
-			else if (step >= 10000L)
-				sprintf(buf, "%ld.%02ld", f / 1000000L, (f % 1000000L) / 10000L);
-			else
-				sprintf(buf, "%ld.%03ld", f / 1000000L, (f % 1000000L) / 1000L);
+			dial_label(buf, f, step);
 			n = strlen(buf);
 			w = TextLength(r, (STRPTR)buf, n);
 			x -= w / 2;
@@ -201,7 +231,7 @@ static void draw_dial(void)
 			if (x + w > dw - 2)
 				x = dw - 2 - w;
 			/* A label that would run into the one before is left out */
-			if (2 + r->TxHeight < base - 8 && x >= 0 && x > last_end + 6)
+			if (2 + r->TxHeight < base - 8 && x >= 0 && x >= last_end + 6)
 			{
 				last_end = x + w;
 				SetAPen(r, 1);
@@ -368,7 +398,10 @@ static void show_values(int c)
 	}
 	if (c & CH_GAIN)
 	{
-		gui_set_slider(gui, ID_GAIN, gain_index(), ngains);
+		/* Until the Pi has sent its gains there is nothing to choose; the
+		   knob is then of an ordinary size rather than the whole slider */
+		gui_set_slider(gui, ID_GAIN, gain_index(), ngains ? ngains : 10);
+		gui_disable(gui, ID_GAIN, ngains == 0);
 		if (gain < 0)
 			strcpy(buf, "Automatic");
 		else
