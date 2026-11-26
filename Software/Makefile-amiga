@@ -38,7 +38,7 @@ ${BIN}/L/a314usb: a314device/a314.h a314device/proto_a314.h a314fs/messages.h us
 
 ${BIN}/Devs/DOSDrivers/USB0: usb/DOSDrivers/USB0 usb/DOSDrivers/USB1 usb/DOSDrivers/USB2 usb/DOSDrivers/USB3
 	mkdir -p ${BIN}/Devs/DOSDrivers
-	cp usb/DOSDrivers/USB? ${BIN}/Devs/DOSDrivers/
+	cp usb/DOSDrivers/USB? usb/DOSDrivers/USB?.info ${BIN}/Devs/DOSDrivers/
 
 ${BIN}/Devs/MountList: a314fs/a314fs-mountlist disk/Mountlist
 	cat a314fs/a314fs-mountlist disk/Mountlist > ${BIN}/Devs/MountList
