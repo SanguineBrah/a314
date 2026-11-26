@@ -19,8 +19,10 @@
 #   tested with ping through the WiFi interface. Then autoconnect is turned
 #   on and the checkpoint is destroyed, which keeps the change.
 #
-# Changing settings needs root, so this service uses "sudo -n", which works
-# for the first user of Raspberry Pi OS.
+# NetworkManager lets this service's user change the settings through a
+# polkit rule (50-a314piwifi.rules), which install-pi.sh installs. Passwords
+# are given to nmcli in a file only this user can read, so they don't appear
+# in the process list or the system log.
 #
 # The Amiga and this service exchange text lines ending in '\n'. SSIDs and
 # passwords are sent as hex, as they can contain any characters.
@@ -49,6 +51,7 @@ import re
 import select
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -83,18 +86,18 @@ class Failed(Exception):
     pass
 
 
-def run(argv, timeout=20, sudo=False):
+def run(argv, timeout=20):
     # Runs a command and returns its output. Raises Failed on errors.
-    if sudo:
-        argv = ['sudo', '-n'] + argv
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise Failed('%s took too long' % argv[2 if sudo else 0])
+        raise Failed('%s took too long' % argv[0])
     except OSError as e:
         raise Failed('cannot run %s: %s' % (argv[0], e.strerror))
     if r.returncode != 0:
-        lines = (r.stderr or r.stdout).strip().split('\n')
+        # The error, without nmcli's hints about journalctl
+        lines = [l for l in (r.stderr or r.stdout).strip().split('\n')
+            if l.strip() and not l.startswith('Hint:')] or ['%s failed' % argv[0]]
         logger.warning('%s failed: %s', ' '.join(argv[:4]), lines[-1])
         raise Failed(lines[-1].replace('Error: ', '')[:70])
     return r.stdout
@@ -193,7 +196,7 @@ class WiFi(object):
         # first, then strongest first, one entry per SSID.
         argv = ['nmcli', '-t', '-f', 'IN-USE,SIGNAL,SECURITY,SSID', 'device',
             'wifi', 'list', '--rescan', 'yes' if rescan else 'no']
-        out = run(argv, timeout=30, sudo=rescan)
+        out = run(argv, timeout=30)
         saved = set(self.saved().values()) if rescan else set()
         best = {}
         for line in out.split('\n'):
@@ -245,7 +248,7 @@ class WiFi(object):
         # unless the checkpoint is destroyed within ROLLBACK_SECONDS.
         try:
             out = run(['busctl', 'call'] + NM + ['CheckpointCreate', 'aouu', '1', path,
-                str(ROLLBACK_SECONDS), str(CHECKPOINT_DELETE_NEW)], sudo=True)
+                str(ROLLBACK_SECONDS), str(CHECKPOINT_DELETE_NEW)])
         except Failed as e:
             raise Failed('cannot protect the change (%s)' % e)
         checkpoint = out.split('"')[1]
@@ -258,31 +261,32 @@ class WiFi(object):
                 if ssid not in self.security:
                     argv += ['802-11-wireless.hidden', 'yes']
                 if key_mgmt:
-                    argv += ['wifi-sec.key-mgmt', key_mgmt, 'wifi-sec.psk', password]
-                out = run(argv, sudo=True)
+                    argv += ['wifi-sec.key-mgmt', key_mgmt]
+                out = run(argv)
                 # "Connection '<name>' (<uuid>) successfully added."
                 uuid = re.search(r'\(([0-9a-f-]{36})\)', out).group(1)
             else:
                 uuid = uuids[0]
             try:
-                run(['nmcli', '--wait', str(CONNECT_SECONDS), 'connection', 'up', 'uuid', uuid],
-                    timeout=CONNECT_SECONDS + 10, sudo=True)
-            except Failed as e:
-                if 'Secrets were required' in str(e):
-                    raise Failed('wrong password for ' + ssid)
-                raise
+                self.activate(uuid, password if key_mgmt else '')
+            except Failed:
+                if key_mgmt:
+                    raise Failed('could not connect to %s, wrong password?' % ssid)
+                raise Failed('could not connect to ' + ssid)
+            if key_mgmt and not self.psk_saved(uuid):
+                raise Failed('the password for %s was not saved' % ssid)
 
             progress('Checking internet access...')
             if not self.has_internet(dev):
                 raise Failed('no internet access through ' + ssid)
             if new_profile:
-                run(['nmcli', 'connection', 'modify', 'uuid', uuid, 'connection.autoconnect', 'yes'], sudo=True)
-            run(['busctl', 'call'] + NM + ['CheckpointDestroy', 'o', checkpoint], sudo=True)
+                run(['nmcli', 'connection', 'modify', 'uuid', uuid, 'connection.autoconnect', 'yes'])
+            run(['busctl', 'call'] + NM + ['CheckpointDestroy', 'o', checkpoint])
         except Exception as e:
             logger.warning('Going back to the previous network: %s', e)
             progress('Going back to the previous network...')
             try:
-                run(['busctl', 'call'] + NM + ['CheckpointRollback', 'o', checkpoint], sudo=True)
+                run(['busctl', 'call'] + NM + ['CheckpointRollback', 'o', checkpoint])
             except Failed:
                 pass    # the checkpoint times out and rolls back anyway
             raise
@@ -291,10 +295,34 @@ class WiFi(object):
         if new_profile:
             for old in uuids:
                 try:
-                    run(['nmcli', 'connection', 'delete', 'uuid', old], sudo=True)
+                    run(['nmcli', 'connection', 'delete', 'uuid', old])
                 except Failed:
                     pass
         logger.info('Connected to %s', ssid)
+
+    def activate(self, uuid, password):
+        # Connects with a profile. A password is given in a file that only
+        # this user can read, deleted straight after; NetworkManager saves it
+        # in the profile.
+        argv = ['nmcli', '--wait', str(CONNECT_SECONDS), 'connection', 'up', 'uuid', uuid]
+        if not password:
+            run(argv, timeout=CONNECT_SECONDS + 10)
+            return
+        fd, path = tempfile.mkstemp(prefix='piwifi-')     # mode 0600
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write('802-11-wireless-security.psk:%s\n' % password)
+            run(argv + ['passwd-file', path], timeout=CONNECT_SECONDS + 10)
+        finally:
+            os.remove(path)
+
+    def psk_saved(self, uuid):
+        try:
+            out = run(['nmcli', '-s', '-g', '802-11-wireless-security.psk', 'connection',
+                'show', 'uuid', uuid])
+        except Failed:
+            return False
+        return out.strip() != ''
 
     def has_internet(self, dev):
         # The router, and one of INTERNET_HOSTS, must answer through dev
@@ -327,7 +355,7 @@ class WiFi(object):
         if in_use in uuids:
             raise Failed('%s is in use, connect to another network first' % ssid)
         for uuid in uuids:
-            run(['nmcli', 'connection', 'delete', 'uuid', uuid], sudo=True)
+            run(['nmcli', 'connection', 'delete', 'uuid', uuid])
 
 
 class Service(object):

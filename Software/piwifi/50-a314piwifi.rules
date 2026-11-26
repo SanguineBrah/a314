@@ -1,0 +1,13 @@
+// Lets the A314 user choose the WiFi network through NetworkManager, for
+// the piwifi service, which runs without a login session.
+polkit.addRule(function(action, subject) {
+    var allowed = [
+        "org.freedesktop.NetworkManager.network-control",
+        "org.freedesktop.NetworkManager.settings.modify.system",
+        "org.freedesktop.NetworkManager.wifi.scan",
+        "org.freedesktop.NetworkManager.checkpoint-rollback"
+    ];
+    if (subject.user == "##USER##" && allowed.indexOf(action.id) >= 0) {
+        return polkit.Result.YES;
+    }
+});

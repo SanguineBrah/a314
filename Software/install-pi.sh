@@ -34,6 +34,7 @@ install_common() {
 
 	# Write configuration files, but don't overwrite
 	[ -f /etc/opt/a314/a314d.conf ] || modinstall a314d/a314d.conf /etc/opt/a314
+	modinstall piwifi/50-a314piwifi.rules /etc/polkit-1/rules.d
 	[ -f /etc/opt/a314/picmd.conf ] || modinstall picmd/picmd.conf /etc/opt/a314
 	[ -f /etc/opt/a314/a314fs.conf ] || modinstall a314fs/a314fs.conf /etc/opt/a314
 	[ -f /etc/opt/a314/disk.conf ] || modinstall disk/disk.conf /etc/opt/a314

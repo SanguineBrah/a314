@@ -7,18 +7,17 @@ can see, and connects to a network or forgets a saved one.
 ## Requirements
 
 - Raspberry Pi OS with NetworkManager, which is the default since Bookworm.
-- The piwifi service, which `install-pi.sh` installs. It changes network
-  settings with `sudo -n`, which works for the first user created on
-  Raspberry Pi OS. Other users need passwordless sudo for `nmcli` and
-  `busctl`.
+- The piwifi service, which `install-pi.sh` installs, with a polkit rule
+  (`/etc/polkit-1/rules.d/50-a314piwifi.rules`) that lets the A314 user
+  change the network settings.
 - Kickstart/Workbench 1.3 or later on the Amiga.
 
 ## Using PiWiFi
 
 Copy the Prefs/A314 drawer from `bin_amiga` (made by `make -f
 Makefile-amiga`) to SYS:Prefs, open it and double-click WiFi. It asks the Pi for its connection and scans for networks,
-which takes a few seconds. In the list, `*` marks the network in use and
-`S` the networks the Pi has saved.
+which takes a few seconds. In the list, `»` marks the network in use, and
+the networks the Pi has saved say "saved".
 
 To connect, click a network (or type the name of a hidden network into the
 NETWORK field), type the password if the network is secured and not saved,
@@ -51,15 +50,23 @@ Connecting to a network on a different subnet still ends SSH sessions to
 the Pi's old address, so reconnect to its new one. Networks with 802.1X
 (enterprise) or WEP security are not supported.
 
-Passwords are sent from the Amiga to the Pi in the clear, are shown while
-they are typed, and are briefly visible on the Pi in the process list while
-`nmcli` runs. Use PiWiFi only where that is acceptable.
+Passwords are sent from the Amiga to the Pi in the clear and are shown
+while they are typed. Use PiWiFi only where that is acceptable. On the Pi,
+a password is given to `nmcli` in a temporary file that only the A314 user
+can read, so it doesn't appear in the process list or the system log, and
+is then kept in the network's profile like any other saved WiFi password.
 
 ## Updating an existing installation
 
-If `install-pi.sh` was run before PiWiFi existed, add this line to
-`/etc/opt/a314/a314d.conf` and restart a314d (`sudo systemctl restart
-a314d`):
+If `install-pi.sh` was run before PiWiFi existed, install the polkit rule
+(replace `pi` with the user a314d runs as):
+
+```
+sed s/##USER##/pi/ piwifi/50-a314piwifi.rules | sudo tee /etc/polkit-1/rules.d/50-a314piwifi.rules
+```
+
+Then add this line to `/etc/opt/a314/a314d.conf` and restart a314d (`sudo
+systemctl restart a314d`):
 
 ```
 piwifi		/opt/a314/venv/bin/python3	/opt/a314/piwifi.py
