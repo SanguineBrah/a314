@@ -12,6 +12,9 @@
 #                       (the same for the same stick, so that the Amiga sees
 #                       it as the same volume when it is inserted again),
 #                       whether it is write-protected, and its name
+#   USB_EJECT           make the stick safe to pull out: its files are
+#                       closed, it is unmounted and powered off (the handler
+#                       sends this when it gets its eject packet)
 #
 # Sticks are found with lsblk, when udev reports a change (and every few
 # seconds), and mounted through udisks2 as the user this service runs as
@@ -91,6 +94,7 @@ ACTION_SEEK             = 1008
 ACTION_EXAMINE_FH       = 1034
 ACTION_USB_UNIT         = 0x5501
 ACTION_USB_STATUS       = 0x5502
+ACTION_USB_EJECT        = 0x5503
 ACTION_UNSUPPORTED      = 65535
 
 ERROR_OBJECT_IN_USE             = 202
@@ -601,6 +605,7 @@ class UsbService(object):
         self.units = [None] * UNITS     # the Volume in each unit
         self.volumes = {}           # uuid -> Volume, every one seen
         self.next_volume_id = 1
+        self.ejected = set()        # uuids ejected but not yet pulled out
         # Loop devices count as sticks too, for testing (the config file's
         # "allow_loop", or A314USB_ALLOW_LOOP=1)
         self.allow_loop = os.environ.get('A314USB_ALLOW_LOOP') == '1'
@@ -691,9 +696,11 @@ class UsbService(object):
                 vol.dev = None
                 vol.volume_id = 0
                 self.units[unit] = None
+        # An ejected stick is not mounted again until it has been pulled out
+        self.ejected &= set(found)
         # Sticks that were put in
         for uuid, (dev, fstype, label, mountpoint, ro) in found.items():
-            if any(v and v.uuid == uuid for v in self.units):
+            if uuid in self.ejected or any(v and v.uuid == uuid for v in self.units):
                 continue
             if None not in self.units:
                 logger.warning('No free unit for %s', dev)
@@ -727,6 +734,36 @@ class UsbService(object):
             logger.info('USB%d: %s (%s, %s) at %s%s', unit, vol.label, dev, fstype, mountpoint,
                         ', read-only' if vol.read_only else '')
 
+    def eject(self, unit):
+        # Makes the stick in the unit safe to pull out
+        vol = self.units[unit]
+        vol.close_files()
+        try:
+            r = subprocess.run(['udisksctl', 'unmount', '-b', vol.dev, '--no-user-interaction'],
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning('Unable to unmount %s: %s', vol.dev, e)
+            return fail(ERROR_OBJECT_IN_USE)
+        if r.returncode != 0:
+            logger.warning('Unable to unmount %s: %s', vol.dev, r.stderr.strip())
+            return fail(ERROR_OBJECT_IN_USE)
+        # Power the stick off (not possible for every device, which is fine)
+        try:
+            out = subprocess.run(['lsblk', '-n', '-o', 'PKNAME', vol.dev], capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+            disk = '/dev/' + out if out else vol.dev
+            subprocess.run(['udisksctl', 'power-off', '-b', disk, '--no-user-interaction'],
+                           capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        logger.info('USB%d: %s (%s) ejected', unit, vol.label, vol.dev)
+        self.ejected.add(vol.uuid)
+        vol.mount = None
+        vol.dev = None
+        vol.volume_id = 0
+        self.units[unit] = None
+        return ok()
+
     # Requests ----------------------------------------------------------
 
     def status(self, unit):
@@ -747,6 +784,10 @@ class UsbService(object):
         unit = self.streams.get(stream_id)
         if rtype == ACTION_USB_STATUS:
             return self.status(unit)
+        if rtype == ACTION_USB_EJECT:
+            if unit is None or not self.units[unit]:
+                return fail(ERROR_NO_DISK)
+            return self.eject(unit)
         vol = self.units[unit] if unit is not None else None
         if not vol:
             return fail(ERROR_NO_DISK)

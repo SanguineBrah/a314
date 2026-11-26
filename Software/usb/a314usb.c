@@ -15,6 +15,11 @@
  * If the connection to the Pi is lost (a314d restarted), the drive is
  * empty until the handler has connected again, which it tries each second.
  *
+ * A packet of type ACTION_USB_EJECT (0x5503, with no arguments) makes the
+ * stick safe to pull out: the Pi closes its files, unmounts it and powers
+ * it off, and the volume goes (as when a stick is pulled out). Prefs/A314/
+ * Disks sends it.
+ *
  * Kickstart 1.3 or later.
  */
 
@@ -47,6 +52,7 @@
 /* The requests of the a314usb service besides a314fs's (see a314usb.py) */
 #define ACTION_USB_UNIT		0x5501
 #define ACTION_USB_STATUS	0x5502
+#define ACTION_USB_EJECT	0x5503	/* also the packet that asks for it */
 
 struct UsbUnitRequest
 {
@@ -1798,6 +1804,28 @@ void reply_simple(struct DosPacket *dp, LONG res1, LONG res2)
 	reply_packet(dp);
 }
 
+void action_eject(struct DosPacket *dp)
+{
+	if (!my_volume)
+	{
+		reply_simple(dp, DOSFALSE, ERROR_NO_DISK);
+		return;
+	}
+	struct UsbStatusRequest *req = (struct UsbStatusRequest *)request_buffer;
+	req->has_response = 0;
+	req->type = ACTION_USB_EJECT;
+	write_req_and_wait_for_res(sizeof(struct UsbStatusRequest));
+
+	short *res = (short *)request_buffer;
+	if (!res[1])
+	{
+		reply_simple(dp, DOSFALSE, res[2]);
+		return;
+	}
+	remove_volume();	// (if the list is busy, the next poll does it)
+	reply_simple(dp, DOSTRUE, 0);
+}
+
 void start(__reg("a0") struct DosPacket *startup_packet)
 {
 	SysBase = *(struct ExecBase **)4;
@@ -1835,6 +1863,7 @@ void start(__reg("a0") struct DosPacket *startup_packet)
 		case ACTION_FLUSH: reply_simple(dp, DOSTRUE, 0); break;
 		case ACTION_INHIBIT: reply_simple(dp, DOSTRUE, 0); break;
 		case ACTION_DISK_CHANGE: poll_unit(); reply_simple(dp, DOSTRUE, 0); break;
+		case ACTION_USB_EJECT: action_eject(dp); break;
 		case ACTION_LOCATE_OBJECT: action_locate_object(dp); break;
 		case ACTION_FREE_LOCK: action_free_lock(dp); break;
 		case ACTION_COPY_DIR: action_copy_dir(dp); break;
