@@ -347,11 +347,13 @@ class Radio(object):
         self.sqls[self.band] = max(0, min(999, level))
         self.state_changed = True
 
-    def set_region(self, i):
-        # Keeps where we were in this region, and goes back to where we
-        # were in the other one.
-        self.saved[self.regions[self.region][0]] = {
-            'band': self.band, 'freqs': self.freqs, 'sqls': self.sqls}
+    def set_region(self, i, keep=True):
+        # Keeps where we were in this region (unless keep is False, as
+        # while loading the saved state, which would be overwritten), and
+        # goes back to where we were in the other one.
+        if keep:
+            self.saved[self.regions[self.region][0]] = {
+                'band': self.band, 'freqs': self.freqs, 'sqls': self.sqls}
         self.region = i
         self.bands = self.regions[i][1]
         self.band, self.freqs, self.sqls = 0, {}, {}
@@ -377,9 +379,9 @@ class Radio(object):
             self.saved = dict(s.get('regions', {}))
             names = [r[0] for r in self.regions]
             if s.get('region') in names:
-                self.set_region(names.index(s['region']))
+                self.set_region(names.index(s['region']), keep=False)
             else:
-                self.set_region(0)
+                self.set_region(0, keep=False)
         except FileNotFoundError:
             pass
         except Exception as e:
