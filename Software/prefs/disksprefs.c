@@ -8,6 +8,10 @@
  *   "At start" makes the drive's image the one it gets when the Amiga
  *   starts.
  * - The SCSI units' images are used from the next start of the Amiga.
+ * - USB memory sticks in the Pi (the drives USB0: to USB3:, if they are
+ *   installed) are shown, and Eject makes one safe to pull out. This is
+ *   done with DOS packets to the drives' handler (L:a314usb), so it works
+ *   whether or not the USB drives are there.
  *
  * As in the Workbench's preferences editors, Save keeps the settings (the
  * start-up images and the SCSI units), Use keeps the drives as they are
@@ -28,11 +32,13 @@
 #include <intuition/intuition.h>
 #include <workbench/startup.h>
 #include <libraries/dos.h>
+#include <libraries/dosextens.h>
 
 #include <proto/alib.h>
 #include <proto/exec.h>
 #include <proto/graphics.h>
 #include <proto/intuition.h>
+#include <proto/dos.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +70,9 @@
 #define ID_SAVE		45
 #define ID_USE		46
 #define ID_CANCEL	47
+#define ID_HEAD5	48
+#define ID_USB		60		/* + 0-3: what is in USB0: to USB3: */
+#define ID_USB_EJECT	64		/* + 0-3 */
 #define ID_QUIT		50
 #define ID_RESTORE	51
 
@@ -126,6 +135,10 @@ static BOOL quit = FALSE;
 	{ GUI_BUTTON, ID_EJECT + (r), 52, (y), 8, 0, kind, 0 }, \
 	{ GUI_CHECKBOX, ID_CHECK + (r), 62, (y), 4, 0, NULL, 0 }
 
+#define USB_ROW(name, n, y) \
+	{ GUI_TEXT, ID_USB + (n), 7, (y), 44, 0, name, 0 }, \
+	{ GUI_BUTTON, ID_USB_EJECT + (n), 52, (y), 8, 0, "Eject", 0 }
+
 static const struct GuiItem items[] =
 {
 	{ GUI_LABEL, ID_HEAD1, 0, 0, 50, 0, NULL, 0 },
@@ -136,10 +149,13 @@ static const struct GuiItem items[] =
 	{ GUI_LABEL, ID_HEAD4, 59, 5, 9, 0, NULL, 0 },
 	ROW("Unit 0", "Remove", 4, 6), ROW("Unit 1", "Remove", 5, 7),
 	ROW("Unit 2", "Remove", 6, 8), ROW("Unit 3", "Remove", 7, 9),
-	{ GUI_TEXT, ID_MSG, 0, 10, 68, 0, NULL, 0 },
-	{ GUI_BUTTON, ID_SAVE, 0, 12, 14, 0, "_Save", 0 },
-	{ GUI_BUTTON, ID_USE, 27, 12, 14, 0, "_Use", 0 },
-	{ GUI_BUTTON, ID_CANCEL, 54, 12, 14, 0, "_Cancel", 0 },
+	{ GUI_LABEL, ID_HEAD5, 0, 10, 50, 0, NULL, 0 },
+	USB_ROW("USB0:", 0, 11), USB_ROW("USB1:", 1, 12),
+	USB_ROW("USB2:", 2, 13), USB_ROW("USB3:", 3, 14),
+	{ GUI_TEXT, ID_MSG, 0, 15, 68, 0, NULL, 0 },
+	{ GUI_BUTTON, ID_SAVE, 0, 17, 14, 0, "_Save", 0 },
+	{ GUI_BUTTON, ID_USE, 27, 17, 14, 0, "_Use", 0 },
+	{ GUI_BUTTON, ID_CANCEL, 54, 17, 14, 0, "_Cancel", 0 },
 };
 
 static const struct GuiMenu menus[] =
@@ -852,6 +868,187 @@ static BOOL unsaved(void)
 	return FALSE;
 }
 
+/* ---------------------------------------------------------------------- */
+/* USB sticks (USB0: to USB3:)                                            */
+
+#define USB_UNITS		4
+#define ACTION_USB_EJECT	0x5503	/* L:a314usb's eject packet */
+#define USB_REFRESH_SECS	2
+
+#define USB_NONE	0		/* no such drive */
+#define USB_EMPTY	1
+#define USB_STICK	2
+
+static int usb_state[USB_UNITS] = { -1, -1, -1, -1 };	/* -1: not shown yet */
+static char usb_name[USB_UNITS][32];
+static BOOL usb_in_use[USB_UNITS];
+static struct MsgPort *usb_mp = NULL;		/* packet replies */
+static struct MsgPort *usb_tmp = NULL;		/* the refresh timer */
+static struct timerequest *usb_treq = NULL;
+static BOOL usb_timer_open = FALSE, usb_timer_pending = FALSE;
+
+/* Sends a DOS packet and waits for it (DoPkt() is 2.0 and later) */
+static LONG send_packet(struct MsgPort *port, LONG type, LONG arg1, LONG *res2)
+{
+	struct StandardPacket *sp;
+	LONG res1;
+
+	sp = AllocMem(sizeof(struct StandardPacket), MEMF_PUBLIC | MEMF_CLEAR);
+	if (!sp)
+	{
+		*res2 = ERROR_NO_FREE_STORE;
+		return DOSFALSE;
+	}
+	sp->sp_Msg.mn_Node.ln_Name = (char *)&sp->sp_Pkt;
+	sp->sp_Pkt.dp_Link = &sp->sp_Msg;
+	sp->sp_Pkt.dp_Port = usb_mp;
+	sp->sp_Pkt.dp_Type = type;
+	sp->sp_Pkt.dp_Arg1 = arg1;
+	PutMsg(port, &sp->sp_Msg);
+	WaitPort(usb_mp);
+	GetMsg(usb_mp);
+	res1 = sp->sp_Pkt.dp_Res1;
+	*res2 = sp->sp_Pkt.dp_Res2;
+	FreeMem(sp, sizeof(struct StandardPacket));
+	return res1;
+}
+
+/* The handler of USBn:, or NULL if there is no such drive (without
+   AmigaDOS asking for a volume of that name) */
+static struct MsgPort *usb_port(int n)
+{
+	struct Process *me = (struct Process *)FindTask(NULL);
+	APTR old = me->pr_WindowPtr;
+	char name[8];
+	struct MsgPort *port;
+
+	sprintf(name, "USB%d:", n);
+	me->pr_WindowPtr = (APTR)-1;
+	port = DeviceProc((STRPTR)name);
+	me->pr_WindowPtr = old;
+	return port;
+}
+
+/* What is in each USB drive, shown if it changed */
+static void refresh_usb(void)
+{
+	struct InfoData *id = AllocMem(sizeof(struct InfoData), MEMF_PUBLIC | MEMF_CLEAR);
+	int n;
+
+	if (!id || !usb_mp)
+	{
+		if (id)
+			FreeMem(id, sizeof(struct InfoData));
+		return;
+	}
+	for (n = 0; n < USB_UNITS; n++)
+	{
+		struct MsgPort *port = usb_port(n);
+		int state = USB_NONE;
+		char name[32] = "";
+		LONG res2;
+
+		if (port && send_packet(port, ACTION_DISK_INFO, MKBADDR(id), &res2))
+		{
+			if (id->id_DiskType == ID_NO_DISK_PRESENT || !id->id_VolumeNode)
+				state = USB_EMPTY;
+			else
+			{
+				struct DeviceList *vol;
+				UBYTE *b;
+				int len;
+				state = USB_STICK;
+				Forbid();
+				vol = (struct DeviceList *)BADDR(id->id_VolumeNode);
+				b = (UBYTE *)BADDR(vol->dl_Name);
+				len = b[0] < 31 ? b[0] : 31;
+				memcpy(name, b + 1, len);
+				name[len] = 0;
+				Permit();
+				usb_in_use[n] = id->id_InUse != DOSFALSE;
+			}
+		}
+		if (state != usb_state[n] || strcmp(name, usb_name[n]))
+		{
+			usb_state[n] = state;
+			strcpy(usb_name[n], name);
+			gui_set_text(gui, ID_USB + n, state == USB_STICK ? name :
+				state == USB_EMPTY ? "No stick" : "Not installed");
+			gui_disable(gui, ID_USB_EJECT + n, state != USB_STICK);
+		}
+	}
+	FreeMem(id, sizeof(struct InfoData));
+}
+
+static void start_usb_timer(void)
+{
+	if (usb_timer_open && !usb_timer_pending)
+	{
+		usb_treq->tr_node.io_Command = TR_ADDREQUEST;
+		usb_treq->tr_time.tv_secs = USB_REFRESH_SECS;
+		usb_treq->tr_time.tv_micro = 0;
+		SendIO((struct IORequest *)usb_treq);
+		usb_timer_pending = TRUE;
+	}
+}
+
+static void usb_eject(int n)
+{
+	struct MsgPort *port;
+	char text[120];
+	LONG res2;
+
+	refresh_usb();
+	if (usb_state[n] != USB_STICK || !(port = usb_port(n)))
+		return;
+	if (usb_in_use[n])
+	{
+		sprintf(text, "Files or drawers on %s (USB%d:)\nare still open. Eject it anyway?", usb_name[n], n);
+		if (!gui_ask(gui, text, "Eject|Cancel"))
+			return;
+	}
+	if (send_packet(port, ACTION_USB_EJECT, 0, &res2))
+	{
+		sprintf(text, "%s can be pulled out of the Pi now", usb_name[n]);
+		set_msg(text);
+	}
+	else if (res2 == ERROR_OBJECT_IN_USE)
+	{
+		sprintf(text, "%s is in use on the Pi, and was not ejected", usb_name[n]);
+		set_msg(text);
+	}
+	else
+		set_msg("Unable to eject the stick");
+	refresh_usb();
+}
+
+static void open_usb(void)
+{
+	usb_mp = CreatePort(NULL, 0);
+	usb_tmp = CreatePort(NULL, 0);
+	if (usb_tmp)
+		usb_treq = (struct timerequest *)CreateExtIO(usb_tmp, sizeof(struct timerequest));
+	if (usb_treq && OpenDevice((STRPTR)TIMERNAME, UNIT_VBLANK, (struct IORequest *)usb_treq, 0) == 0)
+		usb_timer_open = TRUE;
+}
+
+static void close_usb(void)
+{
+	if (usb_timer_pending)
+	{
+		AbortIO((struct IORequest *)usb_treq);
+		WaitIO((struct IORequest *)usb_treq);
+	}
+	if (usb_timer_open)
+		CloseDevice((struct IORequest *)usb_treq);
+	if (usb_treq)
+		DeleteExtIO((struct IORequest *)usb_treq);
+	if (usb_tmp)
+		DeletePort(usb_tmp);
+	if (usb_mp)
+		DeletePort(usb_mp);
+}
+
 static void handle_event(struct GuiEvent *ev)
 {
 	int id = ev->id;
@@ -863,6 +1060,8 @@ static void handle_event(struct GuiEvent *ev)
 	}
 	else if (id >= ID_IMAGE)
 		;
+	else if (id >= ID_USB_EJECT && id < ID_USB_EJECT + USB_UNITS)
+		usb_eject(id - ID_USB_EJECT);
 	else if (id >= ID_CHANGE && id < ID_CHANGE + ROWS)
 		change_pressed(id - ID_CHANGE);
 	else if (id >= ID_EJECT && id < ID_EJECT + ROWS)
@@ -964,17 +1163,29 @@ int main(void)
 	gui_set_text(gui, ID_HEAD2, "At start");
 	gui_set_text(gui, ID_HEAD3, "Hard disks (a314scsi.device), from the next start:");
 	gui_set_text(gui, ID_HEAD4, "Writable");
+	gui_set_text(gui, ID_HEAD5, "USB memory sticks in the Pi:");
 	show_all();
+	open_usb();
+	refresh_usb();
+	start_usb_timer();
 
 	while (!quit)
 	{
 		struct GuiEvent ev;
-		Wait(gui_signal(gui));
+		ULONG tsig = usb_tmp ? 1UL << usb_tmp->mp_SigBit : 0;
+		ULONG sigs = Wait(gui_signal(gui) | tsig);
+		if ((sigs & tsig) && GetMsg(usb_tmp))
+		{
+			usb_timer_pending = FALSE;
+			refresh_usb();
+			start_usb_timer();
+		}
 		while (!quit && gui_event(gui, &ev))
 			handle_event(&ev);
 	}
 
 cleanup:
+	close_usb();
 	gui_close(gui);
 	gui = NULL;
 	if (a314_open)

@@ -32,7 +32,7 @@
 
 #include "a314gui.h"
 
-#define MAX_ITEMS	48
+#define MAX_ITEMS	64
 #define TEXT_LEN	160
 #define MAX_MENUS	24
 #define CHECK_W		26	/* the size of a gadtools checkbox */
