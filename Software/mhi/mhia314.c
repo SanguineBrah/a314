@@ -8,7 +8,19 @@
  * copies them into a ring buffer in A314 memory, from which the mhi
  * service on the Pi (mhi.py) reads them as its decoder needs them. A
  * buffer is given back to the player when the Pi has taken all of it.
- * The decoded audio is played through PiAudio.
+ *
+ * The decoded audio is played through PiAudio, or through AHI (any AHI
+ * device: a sound card, or Paula). Which, is set with the environment
+ * variable A314/MHI, e.g. "OUTPUT=AHI UNIT=0 RATE=44100 BITS=16":
+ *   OUTPUT  AUTO (AHI if it is installed, else PiAudio), AHI or PIAUDIO.
+ *           PiAudio is for Kickstart 1.3 and machines without AHI, and
+ *           for a 68000, on which AHI's mixing for Paula is heavy.
+ *   UNIT    the ahi.device unit (0 to 3), 0 if not given
+ *   RATE    the rate the Pi decodes to for AHI, 44100 if not given
+ *   BITS    16 (the default) or 8, for AHI
+ * For AHI the Pi writes the decoded audio into a few slots in A314 memory,
+ * and the worker plays each through ahi.device and gives it back once
+ * played, which paces the stream.
  *
  * The MHI definitions used here are written out below rather than taken
  * from the developer archive's libraries/mhi.h, so that nothing else is
@@ -30,6 +42,7 @@
 #include <devices/timer.h>
 #include <libraries/dos.h>
 #include <libraries/dosextens.h>
+#include <dos/var.h>
 
 #include <proto/exec.h>
 #include <proto/dos.h>
@@ -79,6 +92,41 @@ struct Library *A314Base;
 #define MHIQ_CROSSMIXING	42
 #define MHIP_COUNT		14	/* parameters 0 (volume) to 13 (band 9) */
 
+/* From devices/ahi.h (AHI developer kit, version 4) */
+#define AHINAME		"ahi.device"
+#define AHIST_S8S	2		/* stereo, 8 bit signed */
+#define AHIST_S16S	3		/* stereo, 16 bit signed */
+
+struct AHIRequest
+{
+	struct IOStdReq ahir_Std;
+	UWORD ahir_Version;
+	UWORD ahir_Pad1;
+	ULONG ahir_Private[2];
+	ULONG ahir_Type;
+	ULONG ahir_Frequency;
+	LONG ahir_Volume;		/* fixed point, 0x10000 is full volume */
+	LONG ahir_Position;		/* fixed point, 0x8000 is the middle */
+	struct AHIRequest *ahir_Link;
+};
+
+/* Output, from A314/MHI */
+#define OUT_AUTO	0
+#define OUT_PIAUDIO	1
+#define OUT_AHI		2
+
+#define ENV_NAME	"A314/MHI"
+#define NSLOTS		4		/* blocks of decoded audio for AHI */
+#define SLOT_BYTES	8192		/* 46 ms of 16-bit stereo at 44.1 kHz */
+
+/* A slot is the Pi's to fill, filled and waiting, or with AHI. AHI is
+   given two at a time, the second linked to the first: its links are for
+   double buffering, and a request linked to one that is itself waiting
+   never starts. */
+#define SLOT_FREE	0
+#define SLOT_WAITING	1
+#define SLOT_AHI	2
+
 #define RING_SIZE	16384		/* MPEG data on its way to the Pi */
 #define COPY_CHUNK	1024		/* copied per pass of the worker (under Forbid) */
 #define WORKER_PRI	5
@@ -90,6 +138,7 @@ struct Library *A314Base;
 #define SIGB_CTL	29		/* allocate or free a decoder */
 #define SIGB_A314	28
 #define SIGB_TIMER	27
+#define SIGB_AHI	26
 
 /* A buffer queued by the player */
 struct QNode
@@ -145,6 +194,23 @@ struct Decoder
 	BOOL read_pending, write_pending, reset_pending;
 	UBYTE in_buf[256];
 	UBYTE out_buf[64];
+
+	/* AHI output */
+	BOOL use_ahi;
+	BOOL out_sent;			/* the Pi has been told with OUT */
+	BOOL ahi_open;
+	ULONG unit, rate, bits;
+	struct AHIRequest *ahi_req[NSLOTS];
+	UBYTE *slots;			/* NSLOTS * SLOT_BYTES of Amiga memory */
+	BOOL slots_direct;		/* ... that are A314 memory themselves */
+	ULONG slots_a314;		/* their A314 address */
+	UBYTE slot_state[NSLOTS];	/* SLOT_... */
+	UWORD slot_len[NSLOTS];
+	UBYTE waiting[NSLOTS];		/* filled slots, in order, not yet given to AHI */
+	UBYTE nwaiting;
+	UBYTE in_ahi;			/* given to AHI: at most 2 */
+	UWORD free_dirty;		/* slots played, FREE not yet sent */
+	struct AHIRequest *last;	/* the last request given to AHI */
 };
 
 struct MhiBase
@@ -153,18 +219,21 @@ struct MhiBase
 	BPTR seg_list;
 	struct A314_IORequest a314_ior;	/* keeps a314.device open */
 	struct Process *worker;
-	struct MsgPort ctl_port, a314_port, timer_port;
+	struct MsgPort ctl_port, a314_port, timer_port, ahi_port;
 	struct timerequest timer_req;
 	BOOL timer_open, timer_pending;
 	struct Decoder dec;
+	/* From A314/MHI, read when a decoder is allocated */
+	UBYTE cfg_output;
+	ULONG cfg_unit, cfg_rate, cfg_bits;
 };
 
 const char library_name[] = LIBRARY_NAME;
-const char id_string[] = LIBRARY_NAME " 1.0 (25.11.2026)";
+const char id_string[] = LIBRARY_NAME " 1.1 (26.11.2026)";
 static const char service_name[] = SERVICE_NAME;
 static const char capabilities[] = "audio/mpeg{audio/mp1,audio/mp2,audio/mp3}";
 static const char decoder_name[] = "A314 (Raspberry Pi, libmpg123)";
-static const char decoder_version[] = "1.0";
+static const char decoder_version[] = "1.1";
 static const char author[] = "A314 project";
 
 static struct MhiBase *the_base;
@@ -244,6 +313,78 @@ static BOOL starts_with(const UBYTE *p, const UBYTE *end, const char *word, cons
 	return TRUE;
 }
 
+static UBYTE upper(UBYTE c)
+{
+	return c >= 'a' && c <= 'z' ? c - 32 : c;
+}
+
+/* Whether p (up to end) starts with key, a word in capitals */
+static BOOL key_is(const UBYTE *p, const UBYTE *end, const char *key)
+{
+	while (*key)
+		if (p >= end || upper(*p++) != *key++)
+			return FALSE;
+	return p == end;
+}
+
+/* Reads A314/MHI (Kickstart 2.0 and later; defaults otherwise). Called
+   by the worker, not under Forbid(), as GetVar() may load from disk. */
+static void read_config(struct MhiBase *base)
+{
+	UBYTE buf[80];
+	LONG len;
+	UBYTE *p, *end;
+
+	base->cfg_output = OUT_AUTO;
+	base->cfg_unit = 0;
+	base->cfg_rate = 44100;
+	base->cfg_bits = 16;
+	if (DOSBase->dl_lib.lib_Version < 36)
+		return;
+	len = GetVar((STRPTR)ENV_NAME, (STRPTR)buf, sizeof(buf), GVF_GLOBAL_ONLY);
+	if (len <= 0)
+		return;
+	/* Words separated by spaces or "=", as AmigaDOS commands take them:
+	   "OUTPUT=AHI" and "OUTPUT AHI" (SetEnv without quotes) are the same */
+	p = buf;
+	end = buf + len;
+	for (;;)
+	{
+		const UBYTE *key, *key_end, *val, *val_end;
+		ULONG n;
+		while (p < end && (*p == ' ' || *p == '=' || *p == '\t' || *p == '\n'))
+			p++;
+		if (p >= end)
+			break;
+		key = p;
+		while (p < end && *p != ' ' && *p != '=' && *p != '\t' && *p != '\n')
+			p++;
+		key_end = p;
+		while (p < end && (*p == ' ' || *p == '=' || *p == '\t'))
+			p++;
+		val = p;
+		while (p < end && *p != ' ' && *p != '=' && *p != '\t' && *p != '\n')
+			p++;
+		val_end = p;
+		n = get_num(val, val_end);
+		if (key_is(key, key_end, "OUTPUT"))
+		{
+			if (key_is(val, val_end, "AHI"))
+				base->cfg_output = OUT_AHI;
+			else if (key_is(val, val_end, "PIAUDIO"))
+				base->cfg_output = OUT_PIAUDIO;
+			else
+				base->cfg_output = OUT_AUTO;
+		}
+		else if (key_is(key, key_end, "UNIT") && n <= 3)
+			base->cfg_unit = n;
+		else if (key_is(key, key_end, "RATE") && n >= 8000 && n <= 48000)
+			base->cfg_rate = n;
+		else if (key_is(key, key_end, "BITS") && (n == 8 || n == 16))
+			base->cfg_bits = n;
+	}
+}
+
 static void wake_player(struct Decoder *d)
 {
 	if (d->player)
@@ -285,6 +426,183 @@ static void reset_socket(struct Decoder *d)
 		a314_cmd(d, &d->reset_ior, A314_RESET, NULL, 0);
 		d->reset_pending = TRUE;
 	}
+}
+
+/* ---------------------------------------------------------------------- */
+/* AHI output (worker)                                                    */
+
+/* Whether nothing is waiting for AHI or playing */
+static BOOL ahi_idle(struct Decoder *d)
+{
+	int i;
+	for (i = 0; i < NSLOTS; i++)
+		if (d->slot_state[i] != SLOT_FREE)
+			return FALSE;
+	return TRUE;
+}
+
+/* Takes back everything given to AHI, unplayed, and forgets the waiting
+   slots */
+static void ahi_abort(struct Decoder *d)
+{
+	int i;
+	for (i = 0; i < NSLOTS; i++)
+	{
+		if (d->slot_state[i] == SLOT_AHI)
+		{
+			AbortIO((struct IORequest *)d->ahi_req[i]);
+			WaitIO((struct IORequest *)d->ahi_req[i]);
+		}
+		d->slot_state[i] = SLOT_FREE;
+	}
+	d->nwaiting = 0;
+	d->in_ahi = 0;
+	d->last = NULL;
+	d->free_dirty = 0;
+}
+
+static void ahi_close(struct Decoder *d)
+{
+	int i;
+	ahi_abort(d);
+	if (d->ahi_open)
+		CloseDevice((struct IORequest *)d->ahi_req[0]);
+	d->ahi_open = FALSE;
+	for (i = 0; i < NSLOTS; i++)
+		if (d->ahi_req[i])
+		{
+			FreeMem(d->ahi_req[i], sizeof(struct AHIRequest));
+			d->ahi_req[i] = NULL;
+		}
+	if (d->slots)
+	{
+		FreeMem(d->slots, NSLOTS * SLOT_BYTES);
+		d->slots = NULL;
+	}
+	if (d->slots_a314 != INVALID_A314_ADDRESS && !d->slots_direct)
+		FreeMemA314(d->slots_a314, NSLOTS * SLOT_BYTES);
+	d->slots_a314 = INVALID_A314_ADDRESS;
+	d->use_ahi = FALSE;
+}
+
+/* Opens ahi.device and the slots; FALSE if AHI isn't there */
+static BOOL ahi_open(struct MhiBase *base, struct Decoder *d)
+{
+	int i;
+
+	d->slots_a314 = INVALID_A314_ADDRESS;
+	d->use_ahi = TRUE;
+	d->unit = base->cfg_unit;
+	d->rate = base->cfg_rate;
+	d->bits = base->cfg_bits;
+	for (i = 0; i < NSLOTS; i++)
+	{
+		d->ahi_req[i] = AllocMem(sizeof(struct AHIRequest), MEMF_PUBLIC | MEMF_CLEAR);
+		if (!d->ahi_req[i])
+			goto fail;
+	}
+	/* In A314 memory that the Amiga sees itself if there is any, so that
+	   nothing needs to be copied; else in Amiga memory, copied from A314
+	   memory as each block arrives */
+	d->slots = AllocMem(NSLOTS * SLOT_BYTES, MEMF_A314 | MEMF_CHIP);
+	if (d->slots)
+	{
+		d->slots_direct = TRUE;
+		d->slots_a314 = TranslateAddressA314(d->slots);
+	}
+	else
+	{
+		d->slots_direct = FALSE;
+		d->slots = AllocMem(NSLOTS * SLOT_BYTES, MEMF_PUBLIC);
+		if (!d->slots)
+			goto fail;
+		d->slots_a314 = AllocMemA314(NSLOTS * SLOT_BYTES);
+		if (d->slots_a314 == INVALID_A314_ADDRESS)
+			goto fail;
+	}
+	d->ahi_req[0]->ahir_Std.io_Message.mn_ReplyPort = &base->ahi_port;
+	d->ahi_req[0]->ahir_Std.io_Message.mn_Length = sizeof(struct AHIRequest);
+	d->ahi_req[0]->ahir_Version = 4;
+	if (OpenDevice((STRPTR)AHINAME, d->unit, (struct IORequest *)d->ahi_req[0], 0))
+		goto fail;
+	d->ahi_open = TRUE;
+	for (i = 1; i < NSLOTS; i++)
+		CopyMem(d->ahi_req[0], d->ahi_req[i], sizeof(struct AHIRequest));
+	for (i = 0; i < NSLOTS; i++)
+		d->slot_state[i] = SLOT_FREE;
+	d->nwaiting = 0;
+	d->in_ahi = 0;
+	d->last = NULL;
+	d->free_dirty = 0;
+	return TRUE;
+
+fail:
+	ahi_close(d);
+	return FALSE;
+}
+
+/* Gives AHI the next waiting slots, keeping two with it */
+static void ahi_pump(struct Decoder *d)
+{
+	while (d->nwaiting && d->in_ahi < 2)
+	{
+		ULONG i = d->waiting[0], k;
+		struct AHIRequest *req = d->ahi_req[i];
+		for (k = 1; k < d->nwaiting; k++)
+			d->waiting[k - 1] = d->waiting[k];
+		d->nwaiting--;
+		req->ahir_Std.io_Command = CMD_WRITE;
+		req->ahir_Std.io_Data = d->slots + i * SLOT_BYTES;
+		req->ahir_Std.io_Length = d->slot_len[i];
+		req->ahir_Std.io_Offset = 0;
+		req->ahir_Type = d->bits == 16 ? AHIST_S16S : AHIST_S8S;
+		req->ahir_Frequency = d->rate;
+		req->ahir_Volume = 0x10000;
+		req->ahir_Position = 0x8000;
+		/* Played straight after the one that is playing, without a gap */
+		req->ahir_Link = d->in_ahi ? d->last : NULL;
+		SendIO((struct IORequest *)req);
+		d->slot_state[i] = SLOT_AHI;
+		d->in_ahi++;
+		d->last = req;
+	}
+}
+
+/* The Pi has put n bytes of audio into slot i: queue it for AHI */
+static void ahi_play(struct Decoder *d, ULONG i, ULONG n)
+{
+	ULONG frame = d->bits == 16 ? 4 : 2;
+
+	if (i >= NSLOTS || d->slot_state[i] != SLOT_FREE || n == 0 || n > SLOT_BYTES || !d->ahi_open)
+		return;
+	n &= ~(frame - 1);		/* whole frames (2 or 4 bytes) */
+	if (n == 0)
+		return;
+	if (!d->slots_direct)
+		ReadMemA314(d->slots + i * SLOT_BYTES, d->slots_a314 + i * SLOT_BYTES, n);
+	d->slot_len[i] = n;
+	d->slot_state[i] = SLOT_WAITING;
+	d->waiting[d->nwaiting++] = i;
+	ahi_pump(d);
+}
+
+static void out_of_data_if_done(struct Decoder *d);
+
+/* AHI has played (or been stopped playing) a slot */
+static void ahi_done(struct Decoder *d, struct AHIRequest *req)
+{
+	int i;
+	for (i = 0; i < NSLOTS; i++)
+		if (d->ahi_req[i] == req && d->slot_state[i] == SLOT_AHI)
+		{
+			d->slot_state[i] = SLOT_FREE;
+			d->in_ahi--;
+			d->free_dirty |= 1 << i;
+			if (d->last == req)
+				d->last = NULL;
+		}
+	ahi_pump(d);
+	out_of_data_if_done(d);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -352,25 +670,40 @@ static void taken(struct Decoder *d, ULONG n)
 		wake_player(d);
 }
 
+/* Out of data only if the Pi has decoded everything (DRY), nothing is
+   waiting, and (with AHI) everything has been played. The player is told,
+   as it may be waiting for the end of the stream; only on the change, so
+   that a player that calls MHIPlay at OUT_OF_DATA isn't woken over and
+   over while it has nothing to queue. */
+static void out_of_data_if_done(struct Decoder *d)
+{
+	if (d->dry && d->status == MHIF_PLAYING && !d->unsent && !d->used &&
+		!((struct QNode *)d->queue.mlh_Head)->node.mln_Succ &&
+		(!d->use_ahi || ahi_idle(d)))
+	{
+		d->status = MHIF_OUT_OF_DATA;
+		wake_player(d);
+	}
+}
+
 static void handle_line(struct Decoder *d, const UBYTE *p, const UBYTE *end)
 {
 	const UBYTE *rest;
 
 	if (starts_with(p, end, "TAKEN", &rest))
 		taken(d, get_num(rest, end));
+	else if (starts_with(p, end, "PCM", &rest))
+	{
+		ULONG i = get_num(rest, end);
+		while (rest < end && *rest != ' ')
+			rest++;
+		if (!d->stop_pending && rest < end)
+			ahi_play(d, i, get_num(rest + 1, end));
+	}
 	else if (starts_with(p, end, "DRY", &rest))
 	{
 		d->dry = TRUE;
-		/* Out of data only if nothing is waiting. The player is told, as
-		   it may be waiting for the end of the stream; only on the change,
-		   so that a player that calls MHIPlay at OUT_OF_DATA isn't woken
-		   over and over while it has nothing to queue. */
-		if (d->status == MHIF_PLAYING && !d->unsent && !d->used &&
-			!((struct QNode *)d->queue.mlh_Head)->node.mln_Succ)
-		{
-			d->status = MHIF_OUT_OF_DATA;
-			wake_player(d);
-		}
+		out_of_data_if_done(d);
 	}
 	else if (starts_with(p, end, "STOPPED", &rest))
 	{
@@ -398,12 +731,38 @@ static void send_next(struct Decoder *d)
 		send_line(d, put_num(p, RING_SIZE));
 		return;
 	}
+	if (d->use_ahi && !d->out_sent)
+	{
+		p = put_num(put_str(p, "OUT "), d->slots_a314);
+		*p++ = ' ';
+		p = put_num(p, SLOT_BYTES);
+		*p++ = ' ';
+		p = put_num(p, NSLOTS);
+		*p++ = ' ';
+		p = put_num(p, d->rate);
+		*p++ = ' ';
+		d->out_sent = TRUE;
+		send_line(d, put_num(p, d->bits));
+		return;
+	}
 	if (d->want_stop)
 	{
 		d->want_stop = FALSE;
 		d->stop_pending = TRUE;
 		d->play_sent = FALSE;
+		/* Stop at once; the Pi takes all the slots as free again */
+		if (d->use_ahi)
+			ahi_abort(d);
 		send_line(d, put_str(p, "STOP"));
+		return;
+	}
+	if (d->free_dirty && !d->stop_pending)
+	{
+		for (i = 0; i < NSLOTS; i++)
+			if (d->free_dirty & (1 << i))
+				break;
+		d->free_dirty &= ~(1 << i);
+		send_line(d, put_num(put_str(p, "FREE "), i));
 		return;
 	}
 	if (d->params_dirty)
@@ -455,6 +814,8 @@ static void check_done(struct Decoder *d)
 		return;
 	if (d->closing || !d->connected)
 	{
+		if (d->ctl->alloc && d->use_ahi)
+			ahi_close(d);
 		d->ctl->ok = d->ctl->alloc ? FALSE : TRUE;
 		d->connected = d->connecting = d->closing = FALSE;
 	}
@@ -499,6 +860,8 @@ static void handle_a314_reply(struct Decoder *d, struct A314_IORequest *ior)
 			d->closing = TRUE;
 			d->connected = FALSE;
 			d->status = MHIF_STOPPED;
+			if (d->use_ahi)
+				ahi_abort(d);
 			while (d->queue.mlh_Head->mln_Succ)
 				AddTail((struct List *)&d->empty, RemHead((struct List *)&d->queue));
 			wake_player(d);
@@ -518,6 +881,18 @@ static void handle_a314_reply(struct Decoder *d, struct A314_IORequest *ior)
 
 static void start_alloc(struct MhiBase *base, struct Decoder *d, struct CtlMsg *cm)
 {
+	/* AHI if asked for, or (AUTO) if it is installed */
+	d->use_ahi = FALSE;
+	d->out_sent = FALSE;
+	if (base->cfg_output != OUT_PIAUDIO)
+	{
+		if (!ahi_open(base, d) && base->cfg_output == OUT_AHI)
+		{
+			cm->ok = FALSE;		/* AHI asked for, and not there */
+			ReplyMsg(&cm->msg);
+			return;
+		}
+	}
 	d->ctl = cm;
 	cm->ok = TRUE;
 	d->connected = d->closing = FALSE;
@@ -533,6 +908,8 @@ static void start_alloc(struct MhiBase *base, struct Decoder *d, struct CtlMsg *
 
 static void start_free(struct Decoder *d, struct CtlMsg *cm)
 {
+	if (d->use_ahi)
+		ahi_close(d);
 	d->ctl = cm;
 	d->closing = TRUE;
 	if (d->connected || d->connecting)
@@ -567,6 +944,8 @@ void worker_run()
 
 	init_port(&base->timer_port, SIGB_TIMER);
 	base->timer_port.mp_SigTask = &me->pr_Task;
+	init_port(&base->ahi_port, SIGB_AHI);
+	base->ahi_port.mp_SigTask = &me->pr_Task;
 	base->timer_req.tr_node.io_Message.mn_ReplyPort = &base->timer_port;
 	base->timer_req.tr_node.io_Message.mn_Length = sizeof(struct timerequest);
 	base->timer_open = OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)&base->timer_req, 0) == 0;
@@ -574,8 +953,11 @@ void worker_run()
 
 	for (;;)
 	{
-		ULONG sigs = Wait((1UL << SIGB_CMD) | (1UL << SIGB_CTL) | (1UL << SIGB_A314) | (1UL << SIGB_TIMER));
+		ULONG sigs = Wait((1UL << SIGB_CMD) | (1UL << SIGB_CTL) | (1UL << SIGB_A314) |
+			(1UL << SIGB_TIMER) | (1UL << SIGB_AHI));
 
+		if (sigs & (1UL << SIGB_CTL))
+			read_config(base);
 		Forbid();
 		if (sigs & (1UL << SIGB_CTL))
 			while ((msg = GetMsg(&base->ctl_port)))
@@ -597,6 +979,9 @@ void worker_run()
 		if (sigs & (1UL << SIGB_A314))
 			while ((msg = GetMsg(&base->a314_port)))
 				handle_a314_reply(d, (struct A314_IORequest *)msg);
+		if (sigs & (1UL << SIGB_AHI))
+			while ((msg = GetMsg(&base->ahi_port)))
+				ahi_done(d, (struct AHIRequest *)msg);
 		if ((sigs & (1UL << SIGB_TIMER)) && GetMsg(&base->timer_port))
 		{
 			base->timer_pending = FALSE;
@@ -909,7 +1294,7 @@ static struct Library *init_library(__reg("a6") struct ExecBase *sys_base, __reg
 	base->lib.lib_Node.ln_Name = (char *)library_name;
 	base->lib.lib_Flags = LIBF_SUMUSED | LIBF_CHANGED;
 	base->lib.lib_Version = 1;
-	base->lib.lib_Revision = 0;
+	base->lib.lib_Revision = 1;
 	base->lib.lib_IdString = (APTR)id_string;
 	the_base = base;
 
@@ -941,7 +1326,7 @@ static struct Library *init_library(__reg("a6") struct ExecBase *sys_base, __reg
 		/* Reserved here, not with AllocSignal() in the worker, which
 		   would clear a signal that is already waiting */
 		base->worker->pr_Task.tc_SigAlloc |= (1UL << SIGB_CMD) | (1UL << SIGB_CTL) |
-			(1UL << SIGB_A314) | (1UL << SIGB_TIMER);
+			(1UL << SIGB_A314) | (1UL << SIGB_TIMER) | (1UL << SIGB_AHI);
 	}
 	Permit();
 	if (!worker_port)

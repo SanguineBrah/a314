@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 # MHI service: decodes MPEG audio (MP1/MP2/MP3) for mhia314.library, an MHI
-# driver for the Amiga, and plays the result through PiAudio. Players
-# that support MHI, such as AmigaAMP, can then play MP3s without the
-# Amiga doing any decoding.
+# driver for the Amiga, and plays the result through PiAudio, or gives it
+# back to the Amiga to play through AHI. Players that support MHI, such as
+# AmigaAMP, can then play MP3s without the Amiga doing any decoding.
 #
 # The Amiga copies the MPEG data that its player queues into a ring buffer
 # in A314 memory, and says how much it has added. This service reads it
@@ -13,6 +13,12 @@
 # to its player. The decoded audio, 8-bit stereo at PiAudio's rate, goes
 # into the piaudio pipe, whose pace (that of the Amiga's audio hardware)
 # sets how fast the stream is used.
+#
+# With OUT, the decoded audio goes back to the Amiga instead, which plays
+# it through AHI (any AHI device: a sound card, or Paula): the Amiga gives
+# a number of slots in A314 memory, this service writes a block of audio
+# into a free one and says PCM, and the Amiga says FREE when it has been
+# played, which paces the stream.
 #
 # Decoding is done by libmpg123 (through ctypes), which also does the
 # volume and the equalizer. Panning and cross-mixing are done here.
@@ -26,12 +32,19 @@
 #   STOP                    stop, and throw away everything not yet played;
 #                           the ring starts again at its beginning
 #   PARAM <id> <value>      an MHI parameter (MHIP_..., values 0 to 100)
+#   OUT <address> <slot size> <slots> <rate> <bits>
+#                           give the audio back in these slots (A314
+#                           address, slot after slot), as stereo at this
+#                           rate, 8 or 16 bits (big-endian), instead of
+#                           playing it through PiAudio; sent after RING
+#   FREE <slot>             the slot has been played and can be filled again
 #
 # Pi -> Amiga:
 #   TAKEN <n>               n bytes of the ring were read and can be reused
 #   DRY                     everything sent has been decoded
 #   STOPPED                 the answer to STOP
 #   PIPE <0|1>              whether the piaudio pipe is open (PiAudio runs)
+#   PCM <slot> <n>          n bytes of audio are in the slot (with OUT)
 #
 # Without libmpg123 the connection is refused, so MHIAllocDecoder() fails.
 # Without PiAudio taking the audio, it is thrown away at the pace it would
@@ -46,7 +59,9 @@ import os
 import select
 import stat
 import struct
+import sys
 import time
+from array import array
 
 from a314d import A314d
 
@@ -70,6 +85,7 @@ MPG123_ADD_FLAGS, MPG123_FORCE_RATE = 2, 3
 MPG123_FORCE_STEREO, MPG123_QUIET = 0x8, 0x20
 MPG123_STEREO = 2
 MPG123_ENC_SIGNED_8 = 0x82
+MPG123_ENC_SIGNED_16 = 0xd0
 MPG123_LR = 3
 EQ_BANDS = 32
 
@@ -85,9 +101,9 @@ TONE_RANGE_DB = 12.0            # 0 and 100 are this much cut or boost
 
 class Decoder(object):
     # An MPEG audio decoder fed with data as it arrives (libmpg123's feed
-    # mode), giving 8-bit stereo at OUT_RATE.
+    # mode), giving stereo at the given rate: 8-bit, or 16-bit big-endian.
 
-    def __init__(self):
+    def __init__(self, rate=OUT_RATE, bits=8):
         name = ctypes.util.find_library('mpg123')
         if not name:
             raise OSError('libmpg123 is not installed')
@@ -115,11 +131,13 @@ class Decoder(object):
         if not self.mh:
             raise OSError('mpg123_new failed (%d)' % err.value)
         self.param(self.mh, MPG123_ADD_FLAGS, MPG123_FORCE_STEREO | MPG123_QUIET, 0.0)
-        self.param(self.mh, MPG123_FORCE_RATE, OUT_RATE, 0.0)
+        self.param(self.mh, MPG123_FORCE_RATE, rate, 0.0)
         lib.mpg123_format_none(self.mh)
-        if lib.mpg123_format(self.mh, OUT_RATE, MPG123_STEREO, MPG123_ENC_SIGNED_8) != MPG123_OK:
-            raise OSError('libmpg123 cannot give 8-bit stereo at %d Hz' % OUT_RATE)
-        self.out = ctypes.create_string_buffer(1024)   # about one MPEG frame
+        enc = MPG123_ENC_SIGNED_16 if bits == 16 else MPG123_ENC_SIGNED_8
+        if lib.mpg123_format(self.mh, rate, MPG123_STEREO, enc) != MPG123_OK:
+            raise OSError('libmpg123 cannot give %d-bit stereo at %d Hz' % (bits, rate))
+        self.bits = bits
+        self.out = ctypes.create_string_buffer(1152 * 2 * bits // 8)   # one MPEG frame
         self.done = ctypes.c_size_t(0)
         self.open()
 
@@ -139,7 +157,12 @@ class Decoder(object):
         while True:
             r = self.lib.mpg123_read(self.mh, self.out, len(self.out), ctypes.byref(self.done))
             if self.done.value:
-                return self.out.raw[:self.done.value]
+                pcm = self.out.raw[:self.done.value]
+                if self.bits == 16 and sys.byteorder == 'little':
+                    a = array('h', pcm)
+                    a.byteswap()            # the Amiga's order
+                    pcm = a.tobytes()
+                return pcm
             if r == MPG123_NEW_FORMAT:
                 continue
             if r in (MPG123_NEED_MORE, MPG123_DONE):
@@ -192,6 +215,23 @@ def eq_factors(params):
     return factors
 
 
+def pan_mix16(audio, panning, crossmixing):
+    # The same for 16-bit big-endian stereo
+    a = array('h', audio)
+    if sys.byteorder == 'little':
+        a.byteswap()
+    lg = min(1.0, (100 - panning) / 50)
+    rg = min(1.0, panning / 50)
+    m = crossmixing / 200
+    for i in range(0, len(a) - 1, 2):
+        l, r = a[i], a[i + 1]
+        a[i] = int(((1 - m) * l + m * r) * lg)
+        a[i + 1] = int(((1 - m) * r + m * l) * rg)
+    if sys.byteorder == 'little':
+        a.byteswap()
+    return a.tobytes()
+
+
 def pan_mix(audio, panning, crossmixing):
     # Panning (0 left .. 50 centre .. 100 right) and cross-mixing (0 stereo
     # .. 100 mono) of 8-bit stereo
@@ -224,6 +264,8 @@ class Player(object):
         self.dry_sent = False
         self.audio = b''            # decoded, waiting for the pipe
         self.params = {}
+        self.out = None             # with OUT: (address, slot size, slots, bits)
+        self.free = []              # slots that can be filled
         self.decoder = None
         try:
             self.decoder = Decoder()
@@ -259,13 +301,55 @@ class Player(object):
             self.audio = b''
             self.rpos = self.avail = 0
             self.dry_sent = False
+            if self.out:
+                self.free = list(range(self.out[2]))
             if self.decoder:
                 self.decoder.reset()
             self.send('STOPPED')
         elif cmd == 'PARAM' and len(nums) == 2:
             self.set_param(nums[0], max(0, min(100, nums[1])))
+        elif cmd == 'OUT' and len(nums) == 5:
+            self.set_out(*nums)
+        elif cmd == 'FREE' and len(nums) == 1 and self.out:
+            if 0 <= nums[0] < self.out[2] and nums[0] not in self.free:
+                self.free.append(nums[0])
         else:
             logger.warning('Unknown command %r', line[:40])
+
+    def set_out(self, address, slot_size, slots, rate, bits):
+        # Audio back to the Amiga (for AHI) instead of into the pipe
+        if not (0 < slots <= 16 and 0 < slot_size <= 65536 and 4000 <= rate <= 96000
+                and bits in (8, 16)):
+            logger.warning('Bad OUT %d %d %d %d %d', address, slot_size, slots, rate, bits)
+            return
+        try:
+            decoder = Decoder(rate, bits)
+        except (OSError, AttributeError) as e:
+            logger.error('Unable to start the decoder: %s', e)
+            return
+        if self.decoder:
+            self.decoder.close()
+        self.decoder = decoder
+        for p, v in list(self.params.items()):
+            self.set_param(p, v)
+        self.out = (address, slot_size, slots, bits)
+        self.free = list(range(slots))
+        self.audio = b''
+
+    def fill_slots(self, flush):
+        # Writes decoded audio into free slots, whole ones (or what there
+        # is, when flush: no more MPEG data for now)
+        address, slot_size, slots, bits = self.out
+        frame = 4 if bits == 16 else 2
+        while self.free and self.audio and (len(self.audio) >= slot_size or flush):
+            n = min(len(self.audio), slot_size)
+            n -= n % frame
+            if n == 0:
+                break
+            slot = self.free.pop(0)
+            self.service.write_mem(address + slot * slot_size, self.audio[:n])
+            self.audio = self.audio[n:]
+            self.send('PCM %d %d' % (slot, n))
 
     def set_param(self, param, value):
         self.params[param] = value
@@ -287,29 +371,35 @@ class Player(object):
         return data
 
     def decode(self):
-        # Keeps AHEAD bytes of audio ready while playing
+        # Keeps AHEAD bytes of audio ready while playing (through PiAudio),
+        # or a slot's worth while a slot is free (with OUT)
         if not self.decoder or not self.playing:
             return
-        while len(self.audio) < AHEAD:
+        target = AHEAD if not self.out else (self.out[1] if self.free else 0)
+        starved = False
+        while len(self.audio) < target:
             pcm = self.decoder.read()
             if pcm is not None:
                 pan = self.params.get(MHIP_PANNING, 50)
                 cross = self.params.get(MHIP_CROSSMIXING, 0)
                 if pan != 50 or cross:
-                    pcm = pan_mix(pcm, pan, cross)
+                    pcm = (pan_mix16 if self.decoder.bits == 16 else pan_mix)(pcm, pan, cross)
                 self.audio += pcm
             elif self.avail and self.ring:
                 self.decoder.feed(self.read_ring())
             else:
-                # DRY once everything decoded has gone to the pipe, so
-                # that a player that stops at DRY doesn't cut the end off
-                if not self.dry_sent and not self.audio:
-                    self.dry_sent = True
-                    self.send('DRY')
-                return
+                starved = True
+                break
+        if self.out:
+            self.fill_slots(starved)
+        # DRY once everything decoded has gone (to the pipe or the Amiga),
+        # so that a player that stops at DRY doesn't cut the end off
+        if starved and not self.dry_sent and not self.audio:
+            self.dry_sent = True
+            self.send('DRY')
 
     def wants_pipe(self):
-        return self.playing and bool(self.audio)
+        return self.playing and bool(self.audio) and not self.out
 
     def drop_audio(self, nbytes):
         # Throws away up to nbytes of decoded audio (decoding more as
@@ -356,6 +446,16 @@ class MhiService(object):
 
     def send(self, stream_id, data):
         self.a314d.send_data(stream_id, data)
+
+    def write_mem(self, address, data):
+        # Like A314d.write_mem, keeping the messages that arrive before
+        # the answer
+        self.a314d.send_write_mem_req(address, data)
+        while True:
+            stream_id, ptype, payload = self.a314d.wait_for_msg()
+            if ptype == A314d.MSG_WRITE_MEM_RES:
+                return
+            self.pending.append((stream_id, ptype, payload))
 
     def read_mem(self, address, length):
         # Like A314d.read_mem, but keeps the messages that arrive before
