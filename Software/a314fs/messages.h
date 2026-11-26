@@ -249,6 +249,24 @@ struct SetProtectResponse
 	short error_code;
 };
 
+struct SetDateRequest
+{
+	short has_response;
+	short type;
+	long key;
+	long days;
+	long minute;
+	long tick;
+	char name[1];
+};
+
+struct SetDateResponse
+{
+	short has_response;
+	short success;
+	short error_code;
+};
+
 struct SetCommentRequest
 {
 	short has_response;

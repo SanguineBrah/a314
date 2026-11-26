@@ -12,6 +12,7 @@
 #include <netinet/tcp.h>
 
 #include <sys/epoll.h>
+#include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -443,18 +444,26 @@ static void shutdown_spi()
         close(spi_fd);
 }
 
-static int check_spidev_bufsiz()
+// Returns 0 if the kernel module parameter in the file at path has the
+// given value, -1 if it can't be read, and -2 if it has another value.
+static int check_module_parameter(const char *path, const char *value)
 {
-    int fd = open("/sys/module/spidev/parameters/bufsiz", O_RDONLY);
+    int fd = open(path, O_RDONLY);
     if (fd == -1)
         return -1;
 
     char buf[32];
-    auto actual = read(fd, buf, strlen(buf));
+    auto actual = read(fd, buf, sizeof(buf) - 1);
 
     close(fd);
 
-    if (strncmp(buf, "65536", actual) != 0)
+    if (actual <= 0)
+        return -1;
+    buf[actual] = 0;
+
+    // The file holds the value followed by a newline
+    size_t len = strlen(value);
+    if (strncmp(buf, value, len) != 0 || (buf[len] != '\n' && buf[len] != 0))
         return -2;
 
     return 0;
@@ -998,6 +1007,11 @@ static int init_server_socket()
         return -1;
     }
 
+    // So that a314d can be restarted straight away, while connections from
+    // the previous run are still in TIME_WAIT
+    int one = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
     struct sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
@@ -1051,8 +1065,14 @@ static int init_driver()
     if (init_spi() != 0)
         return -1;
 
-    if (check_spidev_bufsiz())
+    if (check_module_parameter("/sys/module/spidev/parameters/bufsiz", "65536"))
         logger_warning("The spidev.bufsiz argument in /boot/cmdline.txt is set incorrectly, it should be 65536\n");
+
+    // With polling enabled, SPI reads of about 96 to 230 bytes can return
+    // stale data on recent kernels. Not every Pi uses spi_bcm2835, so only
+    // warn if the parameter is there and set to something else.
+    if (check_module_parameter("/sys/module/spi_bcm2835/parameters/polling_limit_us", "0") == -2)
+        logger_warning("The spi_bcm2835.polling_limit_us argument in /boot/cmdline.txt should be 0, or data read from the A314 can be corrupted\n");
 
     spi_proto_ver = spi_protocol_version();
 #elif defined(MODEL_FE) || defined(MODEL_CP)
@@ -1451,6 +1471,11 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
             }
             else if (child == 0)
             {
+                // a314d blocks SIGTERM (see init_sigterm), and a blocked
+                // signal stays blocked across exec. Unblock it, so that the
+                // service can be stopped with SIGTERM.
+                sigprocmask(SIG_SETMASK, &original_sigset, NULL);
+
                 close(fds[0]);
                 int fd = fds[1];
 
@@ -2031,6 +2056,12 @@ static void main_loop()
 
     while (!done)
     {
+        // Collect services that have exited, so that they don't stay
+        // around as zombie processes. The services are the only child
+        // processes a314d starts.
+        while (waitpid(-1, NULL, WNOHANG) > 0)
+            ;
+
         struct epoll_event ev;
         int n = epoll_pwait(epfd, &ev, 1, 1000, &original_sigset);
         if (n == -1)
@@ -2147,8 +2178,11 @@ int main(int argc, char **argv)
 
     load_config_file(conf_filename.c_str());
 
-    if (init_driver() == 0)
+    // A failure to start is reported in the exit status, so that systemd
+    // shows it
+    int rc = init_driver() == 0 ? 0 : 1;
+    if (rc == 0)
         main_loop();
     shutdown_driver();
-    return 0;
+    return rc;
 }

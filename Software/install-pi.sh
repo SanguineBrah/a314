@@ -130,6 +130,14 @@ install_trapdoor() {
 		echo `cat $CMDLINE_FILE` spidev.bufsiz=65536 > $CMDLINE_FILE
 	fi
 
+	# Add spi_bcm2835.polling_limit_us=0
+	# With polling enabled, SPI reads of about 96 to 230 bytes can return
+	# stale data on recent kernels, which corrupts data read from the A314.
+	if ! grep -q "spi_bcm2835.polling_limit_us=0" $CMDLINE_FILE
+	then
+		echo `cat $CMDLINE_FILE` spi_bcm2835.polling_limit_us=0 > $CMDLINE_FILE
+	fi
+
 	install_common
 }
 

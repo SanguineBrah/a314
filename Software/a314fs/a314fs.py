@@ -359,6 +359,10 @@ def mtime_to_dmt(mtime):
     days = max(0, days) # If days are before Amiga epoc
     return (days, mins, ticks)
 
+def dmt_to_mtime(days, mins, ticks):
+    days += 2922 # Days between 1970-01-01 and 1978-01-01
+    return days * 86400 + mins * 60 + ticks // 50
+
 def process_examine_object(key):
     logger.debug('ACTION_EXAMINE_OBJECT, key: %s', key)
     ol = locks[key]
@@ -665,6 +669,21 @@ def process_set_protect(key, name, mask):
     else:
         return struct.pack('>HH', 0, ERROR_OBJECT_NOT_FOUND)
 
+def process_set_date(key, name, days, mins, ticks):
+    logger.debug('ACTION_SET_DATE, key: %s, name: %s, date: %s %s %s', key, name, days, mins, ticks)
+
+    cp = find_path(key, name)
+    if cp is None or len(cp) == 0:
+        return struct.pack('>HH', 0, ERROR_OBJECT_NOT_FOUND)
+
+    path = '/'.join(cp)
+    try:
+        mtime = dmt_to_mtime(days, mins, ticks)
+        os.utime(path, (os.stat(path).st_atime, mtime))
+    except OSError:
+        return struct.pack('>HH', 0, ERROR_OBJECT_NOT_FOUND)
+    return struct.pack('>HH', 1, 0)
+
 def process_set_comment(key, name, comment):
     logger.debug('ACTION_SET_COMMENT, key: %s, name: %s, comment: %s', key, name, comment)
 
@@ -770,6 +789,10 @@ def process_request(req):
         key, mask, nlen = struct.unpack('>IIB', req[2:11])
         name = req[11:11+nlen].decode('latin-1')
         return process_set_protect(key, name, mask)
+    elif rtype == ACTION_SET_DATE:
+        key, days, mins, ticks, nlen = struct.unpack('>IIIIB', req[2:19])
+        name = req[19:19+nlen].decode('latin-1')
+        return process_set_date(key, name, days, mins, ticks)
     elif rtype == ACTION_SET_COMMENT:
         key, nlen, clen = struct.unpack('>IBB', req[2:8])
         name = req[8:8+nlen].decode('latin-1')
