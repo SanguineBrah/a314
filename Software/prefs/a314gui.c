@@ -23,6 +23,7 @@
 #include <proto/graphics.h>
 #include <proto/intuition.h>
 #include <proto/gadtools.h>
+#include <proto/dos.h>
 #include <clib/alib_protos.h>
 
 #include <stdio.h>
@@ -91,6 +92,14 @@ struct Gui
 
 static struct TextAttr topaz8 = { (STRPTR)"topaz.font", 8, FS_NORMAL, FPF_ROMFONT };
 static const char *no_choices[] = { "", NULL };
+
+/* For testing the Workbench 1.3 gadgets on a later Workbench: the
+   environment variable A314GUI set to "1.3" */
+static BOOL want_old_gadgets(void)
+{
+	char buf[8];
+	return GetVar((STRPTR)"A314GUI", (STRPTR)buf, sizeof(buf), 0) > 0 && strcmp(buf, "1.3") == 0;
+}
 
 static struct Item *find(struct Gui *gui, UWORD id)
 {
@@ -608,7 +617,7 @@ struct Gui *gui_open(const char *title, const struct GuiItem *items, int nitems,
 		parse_label(t);
 	}
 
-	if (!GadToolsBase && IntuitionBase->LibNode.lib_Version >= 37)
+	if (!GadToolsBase && IntuitionBase->LibNode.lib_Version >= 37 && !want_old_gadgets())
 		GadToolsBase = OpenLibrary((STRPTR)"gadtools.library", 37);
 	gui->gt = GadToolsBase != NULL;
 	if (gui->gt)

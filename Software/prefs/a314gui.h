@@ -6,7 +6,8 @@
  * in the screen's font, with menus and keyboard shortcuts, so that a tool
  * looks and works like a built-in preferences editor. On Workbench 1.3,
  * which has no gadtools.library, the same window is made from plain
- * Intuition gadgets in topaz 8, with the same 3D look.
+ * Intuition gadgets in topaz 8, with the same 3D look. (To try those on a
+ * later Workbench, set the environment variable A314GUI to "1.3".)
  *
  * A window is a list of items placed on a grid: x and w in columns (the
  * width of an average character of the font), y and h in rows (one gadget
