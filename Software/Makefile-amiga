@@ -73,3 +73,8 @@ endif
 
 ${BIN}/C/A314shd: a314device/a314.h a314sh/a314shd.c
 	${VC} a314sh/a314shd.c -lamiga -o ${BIN}/C/A314shd
+
+all: ${BIN}/Libs/MHI/mhia314.library
+${BIN}/Libs/MHI/mhia314.library: a314device/a314.h a314device/proto_a314.h mhi/romtag.asm mhi/mhia314.c
+	mkdir -p ${BIN}/Libs/MHI
+	${VC} mhi/romtag.asm mhi/mhia314.c -O3 -nostdlib -o ${BIN}/Libs/MHI/mhia314.library -lamiga
