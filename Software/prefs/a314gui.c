@@ -782,7 +782,7 @@ struct Gui *gui_open(const char *title, const struct GuiItem *items, int nitems,
 		nw.DetailPen = 0;
 		nw.BlockPen = 1;
 		nw.IDCMPFlags = IDCMP_CLOSEWINDOW | IDCMP_GADGETUP | IDCMP_GADGETDOWN |
-			IDCMP_MOUSEMOVE | IDCMP_MOUSEBUTTONS | IDCMP_VANILLAKEY;
+			IDCMP_MOUSEMOVE | IDCMP_MOUSEBUTTONS | IDCMP_VANILLAKEY | IDCMP_RAWKEY;
 		nw.Flags = WFLG_DRAGBAR | WFLG_DEPTHGADGET | WFLG_CLOSEGADGET |
 			WFLG_SMART_REFRESH | WFLG_NOCAREREFRESH | WFLG_ACTIVATE | WFLG_RMBTRAP;
 		nw.Title = (UBYTE *)title;
@@ -1254,7 +1254,16 @@ void gui_disable(struct Gui *gui, UWORD id, BOOL off)
 		if (off)
 			OffGadget(t->gad, gui->win, NULL);
 		else
+		{
+			/* OnGadget() draws the gadget again, but over the ghosting
+			   pattern: clear that first */
+			struct Gadget *g = t->gad;
+			struct RastPort *rp = gui->win->RPort;
+			SetAPen(rp, 0);
+			SetDrMd(rp, JAM1);
+			RectFill(rp, g->LeftEdge, g->TopEdge, g->LeftEdge + g->Width - 1, g->TopEdge + g->Height - 1);
 			OnGadget(t->gad, gui->win, NULL);
+		}
 	}
 }
 
