@@ -1036,8 +1036,13 @@ static void shutdown_server_socket()
     server_socket = -1;
 }
 
+// Set when SIGTERM came: epoll_pwait() is also interrupted (EINTR) by
+// other things, e.g. a debugger attaching, which mustn't stop a314d
+static volatile sig_atomic_t got_sigterm = 0;
+
 static void sigterm_handler(int signo)
 {
+    got_sigterm = 1;
 }
 
 static void init_sigterm()
@@ -2066,6 +2071,8 @@ static void main_loop()
         int n = epoll_pwait(epfd, &ev, 1, 1000, &original_sigset);
         if (n == -1)
         {
+            if (errno == EINTR && !got_sigterm)
+                continue;
             if (errno == EINTR)
             {
                 logger_info("Received SIGTERM\n");
