@@ -22,6 +22,12 @@
 #   SEEK <1|-1>         go to the next active channel up or down
 #   SCAN <1|-1|0>       scan up or down through the active channels, or stop
 #   SWEEP               sweep the band again for active channels
+#   POLL                nothing to do: asks for what has changed
+#
+# The service only ever sends in answer to a line from the Amiga (POLL
+# when the Amiga has nothing else to say), never by itself: while WHDLoad
+# has the machine, anything sent would raise the A314 interrupt under the
+# game. Meanwhile it keeps only the latest of each state line.
 #
 # Pi -> Amiga:
 #   REGIONS <n>
@@ -37,7 +43,7 @@
 #   ACTCLR <band>       forget the active channels of a band
 #   ACT <band> <ch>...  active channels, as channel numbers from the band's lo
 #   MSG <text>          status message (no text clears it)
-#   HB                  heartbeat, every 2 seconds
+#   HB                  the answer when nothing has changed
 
 import errno
 import json
@@ -77,7 +83,10 @@ RETRY_DELAY = 5.0               # after an error
 SWEEP_TIMEOUT = 30.0
 NO_AUDIO_TIMEOUT = 5.0          # rtl_fm hung (only checked with squelch off)
 ACTIVITY_MAX_AGE = 300.0        # sweeps older than this are redone
-HEARTBEAT_INTERVAL = 2.0
+# Lines that give a state: while the Amiga isn't asking, only the latest
+# of each is kept. Other lines (lists) are kept, up to MAX_QUEUED in all.
+STATE_LINES = (b'LVL', b'ST', b'RUN', b'PIPE', b'MSG', b'REG')
+MAX_QUEUED = 400
 NOTICE_TIME = 4.0
 
 # Friendlier text for common rtl_fm and rtl_power errors
@@ -889,14 +898,19 @@ class Service(object):
         self.stream_id = None
         self.inbuf = b''
         self.outbuf = []
-        self.heartbeat_at = 0
+        self.asked = False
         self.radio = Radio(load_config(), self.send)
         self.state_saved_at = 0
 
     def send(self, line):
         if self.stream_id is not None:
-            data = line.encode('latin-1', 'replace')[:MAX_CHUNK - 1]
-            self.outbuf.append(data + b'\n')
+            data = line.encode('latin-1', 'replace')[:MAX_CHUNK - 1] + b'\n'
+            # Of the lines that give a state, only the latest is kept
+            word = data.split(b' ', 1)[0].rstrip(b'\n')
+            if word in STATE_LINES:
+                self.outbuf = [l for l in self.outbuf if l.split(b' ', 1)[0].rstrip(b'\n') != word]
+            self.outbuf.append(data)
+            del self.outbuf[:-MAX_QUEUED]
 
     def flush(self):
         # Send the queued lines in chunks of whole lines.
@@ -932,13 +946,15 @@ class Service(object):
             self.a314d.send_connect_response(stream_id, 0)
             self.stream_id = stream_id
             self.inbuf = b''
-            self.heartbeat_at = 0
+            self.asked = False
         elif stream_id == self.stream_id:
             if ptype == A314d.MSG_DATA:
                 self.inbuf += payload
+                self.asked = True
                 while b'\n' in self.inbuf:
                     line, self.inbuf = self.inbuf.split(b'\n', 1)
-                    self.radio.handle_command(line.decode('latin-1'))
+                    if line.strip() != b'POLL':
+                        self.radio.handle_command(line.decode('latin-1'))
                 self.inbuf = self.inbuf[-256:]
             elif ptype == A314d.MSG_EOS:
                 self.a314d.send_reset(stream_id)
@@ -970,13 +986,15 @@ class Service(object):
             if self.stream_id is not None:
                 now = time.time()
                 self.radio.tick()
-                if now >= self.heartbeat_at:
-                    self.heartbeat_at = now + HEARTBEAT_INTERVAL
-                    self.send('HB')
                 if now - self.state_saved_at > 10.0:
                     self.state_saved_at = now
                     self.radio.save_state()
-                self.flush()
+                # Only in answer to the Amiga
+                if self.asked:
+                    self.asked = False
+                    if not self.outbuf:
+                        self.send('HB')
+                    self.flush()
 
 
 if __name__ == '__main__':

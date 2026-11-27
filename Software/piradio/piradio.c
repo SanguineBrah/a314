@@ -42,7 +42,10 @@
 /* Timing, in ticks of 0.1 s */
 #define RETRY_TICKS		30	/* pause before reconnecting */
 #define CONNECT_TIMEOUT_TICKS	50
-#define RX_TIMEOUT_TICKS	80	/* the service sends HB every 2 s */
+#define RX_TIMEOUT_TICKS	80	/* the service answers every POLL */
+#define POLL_TICKS	2	/* POLL every 0.2 s, when nothing else is sent: the
+				   service only ever answers, so that it never
+				   interrupts while WHDLoad has the machine */
 #define SHUTDOWN_TIMEOUT_TICKS	20
 #define HOLD_TICKS		6	/* the Pi's state doesn't undo the user's
 					   changes for this long */
@@ -892,7 +895,15 @@ static void start_timer(void)
 
 static void tick(void)
 {
+	static int poll_ticks;
+
 	connection_tick();
+	if (conn_state == CS_UP && ++poll_ticks >= POLL_TICKS)
+	{
+		poll_ticks = 0;
+		if (cmdq_len == 0 && out_dirty == 0)
+			queue_cmd("POLL");
+	}
 	if (hold_ticks > 0)
 		hold_ticks--;
 	blink++;
