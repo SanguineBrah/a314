@@ -404,17 +404,48 @@ void wait_for_response()
 	}
 }
 
-void write_req_and_wait_for_res(int len)
+// Sends the request in the request buffer and gets the response into it.
+// FALSE if the connection to the Pi failed (it was reset, e.g. when a314d
+// was restarted); then the buffer still holds the request.
+static BOOL exchange(int len)
 {
 	if (!request_buffer_in_a314_memory)
 		WriteMemA314(request_buffer_address, request_buffer, len);
 	ULONG buf[2] = {request_buffer_address, len};
-	a314_write((char *)&buf[0], 8);
-	//wait_for_response();
-	a314_read((char *)&buf[1], 4);
+	if (a314_write((char *)&buf[0], 8) != A314_WRITE_OK)
+		return FALSE;
+	if (a314_read((char *)&buf[1], 4) != A314_READ_OK)
+		return FALSE;
 	len = buf[1];
+	if (len < 0 || len > REQ_RES_BUF_SIZE)
+		len = REQ_RES_BUF_SIZE;
 	if (!request_buffer_in_a314_memory)
 		ReadMemA314(request_buffer, request_buffer_address, len);
+	return TRUE;
+}
+
+void write_req_and_wait_for_res(int len)
+{
+	if (exchange(len))
+		return;
+
+	// The connection was reset: connect again, and send the request once
+	// more (the service starts afresh, so it may not know the lock or file
+	// asked about, and says so). Without this, the request would be taken
+	// for its own response: a read would then copy a length made of the
+	// request's bytes, and could overwrite all of memory.
+	dbg("Connection to the Pi lost, connecting again\n");
+	a314_reset();
+	if (a314_connect("a314fs") == A314_CONNECT_OK && exchange(len))
+		return;
+
+	// No a314fs service on the Pi: a failure (every response starts with
+	// has_response, success, error_code), so that DOS says no disk is there
+	// and a retry connects again
+	short *res = (short *)request_buffer;
+	res[0] = 0;
+	res[1] = 0;
+	res[2] = ERROR_NO_DISK;
 }
 
 struct FileLock *create_and_add_file_lock(long key, long mode)
@@ -843,6 +874,15 @@ void action_read(struct DosPacket *dp)
 			return;
 		}
 
+		if (res->actual < 0 || res->actual > to_read)
+		{
+			dbg("  Bad length $l\n", (LONG)res->actual);
+			dp->dp_Res1 = -1;
+			dp->dp_Res2 = ERROR_SEEK_ERROR;
+			reply_packet(dp);
+			return;
+		}
+
 		if (res->actual)
 		{
 			ReadMemA314(dst, data_buffer_address, res->actual);
@@ -894,6 +934,15 @@ void action_write(struct DosPacket *dp)
 			dbg("  Failed, error code $l\n", (LONG)res->error_code);
 			dp->dp_Res1 = total_written;
 			dp->dp_Res2 = res->error_code;
+			reply_packet(dp);
+			return;
+		}
+
+		if (res->actual < 0 || res->actual > to_write)
+		{
+			dbg("  Bad length $l\n", (LONG)res->actual);
+			dp->dp_Res1 = total_written;
+			dp->dp_Res2 = ERROR_SEEK_ERROR;
 			reply_packet(dp);
 			return;
 		}
