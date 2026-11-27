@@ -125,6 +125,13 @@ BOOL pending_a314_write;
 BOOL pending_a314_reset;
 BOOL connection_lost;      // the stream was reset by the Pi side
 
+// Offline (S2_OFFLINE), the stream to the ethernet service is closed, so
+// that the Pi forgets the read buffers it was given and sends nothing (not
+// even an interrupt) until the device is online again: e.g. while WHDLoad
+// has the machine, with the TCP/IP stack put offline around it.
+volatile BOOL want_offline;
+BOOL offline;
+
 struct ServiceMsg a314_read_buf;
 struct ServiceMsg a314_write_buf;
 
@@ -497,7 +504,24 @@ void device_process_run()
 
 	while (TRUE)
 	{
-		if (connection_lost && !shutting_down && !pending_a314_read && !pending_a314_write)
+		if (want_offline && !offline && !shutting_down)
+		{
+			offline = TRUE;
+			if (!connection_lost)
+			{
+				// The pending read and write end with a reset
+				send_a314_cmd(&reset_ior, A314_RESET, NULL, 0);
+				pending_a314_reset = TRUE;
+			}
+		}
+		else if (!want_offline && offline && !pending_a314_reset)
+		{
+			offline = FALSE;
+			connection_lost = TRUE;     // connect again, below
+		}
+
+		if (connection_lost && !offline && !shutting_down && !pending_a314_read &&
+			!pending_a314_write && !pending_a314_reset)
 		{
 			if (!reconnect(shutdown_sigmask))
 			{
@@ -509,7 +533,7 @@ void device_process_run()
 		}
 
 		complete_read_reqs();
-		if (!connection_lost)
+		if (!connection_lost && !offline)
 			maybe_write_req();
 
 		if (shutting_down && !pending_a314_read && !pending_a314_write && !pending_a314_reset)
@@ -519,8 +543,13 @@ void device_process_run()
 
 		if ((sigs & shutdown_sigmask) && !shutting_down)
 		{
-			send_a314_cmd(&reset_ior, A314_RESET, NULL, 0);
-			pending_a314_reset = TRUE;
+			// (Not while a reset for going offline is still under way: the
+			// request can't be sent twice; that one closes the stream too.)
+			if (!pending_a314_reset)
+			{
+				send_a314_cmd(&reset_ior, A314_RESET, NULL, 0);
+				pending_a314_reset = TRUE;
+			}
 			shutting_down = TRUE;
 		}
 
@@ -811,10 +840,14 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2
 	case S2_ONLINE:
 		set_last_start();
 		is_online = TRUE;
+		want_offline = FALSE;
+		Signal(&device_process->pr_Task, sana2_sigmask);
 		break;
 
 	case S2_OFFLINE:
 		is_online = FALSE;
+		want_offline = TRUE;
+		Signal(&device_process->pr_Task, sana2_sigmask);
 		break;
 
 	case S2_GETSTATIONADDRESS:
