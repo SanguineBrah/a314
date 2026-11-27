@@ -123,6 +123,7 @@ struct A314_IORequest reset_ior;
 BOOL pending_a314_read;
 BOOL pending_a314_write;
 BOOL pending_a314_reset;
+BOOL connection_lost;      // the stream was reset by the Pi side
 
 struct ServiceMsg a314_read_buf;
 struct ServiceMsg a314_write_buf;
@@ -293,7 +294,8 @@ static void handle_a314_reply(struct A314_IORequest *ior)
 		}
 		else // A314_WRITE_RESET
 		{
-			// TODO: Handle. What if pi-side is shutting down.
+			// The ethernet service went away (e.g. a314d restarted)
+			connection_lost = TRUE;
 		}
 	}
 	else if (ior == &read_ior)
@@ -319,13 +321,48 @@ static void handle_a314_reply(struct A314_IORequest *ior)
 		}
 		else // A314_READ_RESET
 		{
-			// TODO: Handle. What if pi-side is shutting down.
+			connection_lost = TRUE;
 		}
 	}
 	else if (ior == &reset_ior)
 	{
 		pending_a314_reset = FALSE;
 	}
+}
+
+static void move_all(struct List *from, struct List *to)
+{
+	struct Node *n;
+	while ((n = RemHead(from)))
+		AddTail(to, n);
+}
+
+// After the stream was reset (e.g. a314d was restarted), when nothing is
+// pending any more: the frames that were with the Pi are lost (as on a
+// glitch of a real network), their buffers are free again, and the device
+// connects to the ethernet service again, every two seconds until it is
+// there (or the device is closed). FALSE if it is to shut down instead.
+static BOOL reconnect(ULONG shutdown_sigmask)
+{
+	move_all(&et_rbuf_pending_list, &et_rbuf_free_list);
+	move_all(&et_wbuf_pending_list, &et_wbuf_free_list);
+
+	while (TRUE)
+	{
+		do_a314_cmd(&reset_ior, A314_RESET, NULL, 0);
+		do_a314_cmd(&reset_ior, A314_CONNECT, (char *)service_name, strlen(service_name));
+		if (reset_ior.a314_Request.io_Error == A314_CONNECT_OK)
+			break;
+		if (SetSignal(0, 0) & shutdown_sigmask)
+			return FALSE;
+		Delay(100);
+	}
+
+	connection_lost = FALSE;
+	last_req_kind = 0;
+	send_a314_cmd(&read_ior, A314_READ, (void *)&a314_read_buf, sizeof(a314_read_buf));
+	pending_a314_read = TRUE;
+	return TRUE;
 }
 
 static struct IOSana2Req *remove_matching_rbuf(ULONG type)
@@ -460,8 +497,20 @@ void device_process_run()
 
 	while (TRUE)
 	{
+		if (connection_lost && !shutting_down && !pending_a314_read && !pending_a314_write)
+		{
+			if (!reconnect(shutdown_sigmask))
+			{
+				// Closed meanwhile: nothing is pending, the stream is reset
+				shutting_down = TRUE;
+				connection_lost = FALSE;
+				continue;
+			}
+		}
+
 		complete_read_reqs();
-		maybe_write_req();
+		if (!connection_lost)
+			maybe_write_req();
 
 		if (shutting_down && !pending_a314_read && !pending_a314_write && !pending_a314_reset)
 			break;
