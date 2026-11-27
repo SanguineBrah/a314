@@ -389,5 +389,5 @@ while not done:
         else:
             fd.handle_text()
 
-    for s in sessions.values():
+    for s in list(sessions.values()):      # handle_timeout may remove it
         s.handle_timeout()
