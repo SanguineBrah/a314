@@ -24,6 +24,9 @@
 #include <proto/intuition.h>
 #include <proto/gadtools.h>
 #include <proto/dos.h>
+#include <proto/console.h>
+#include <devices/console.h>
+#include <exec/io.h>
 #include <clib/alib_protos.h>
 
 #include <stdio.h>
@@ -82,6 +85,7 @@ struct Gui
 	struct TextAttr *ta;
 	struct TextFont *font;
 	BOOL gt;
+	BOOL convert_keys;		/* 1.3: raw keys only, turned into characters here */
 	int cw, rh, step, mx, my;	/* grid */
 	UBYTE text_pen, shine_pen, shadow_pen, fill_pen, fill_text_pen;
 	const char *title;
@@ -89,6 +93,33 @@ struct Gui
 	int n;
 	struct Item items[MAX_ITEMS];
 };
+
+/* Workbench 1.3's Intuition sends no raw keys (such as the cursor keys)
+   to a window that asks for characters too: there, a window asks only for
+   raw keys, and console.device turns them into characters */
+struct Device *ConsoleDevice;
+static struct IOStdReq console_io;
+static int console_users;
+
+static BOOL open_console(void)
+{
+	if (console_users++ == 0) {
+		if (OpenDevice((STRPTR)"console.device", -1, (struct IORequest *)&console_io, 0) != 0) {
+			console_users = 0;
+			return FALSE;
+		}
+		ConsoleDevice = console_io.io_Device;
+	}
+	return TRUE;
+}
+
+static void close_console(void)
+{
+	if (--console_users == 0) {
+		CloseDevice((struct IORequest *)&console_io);
+		ConsoleDevice = NULL;
+	}
+}
 
 static struct TextAttr topaz8 = { (STRPTR)"topaz.font", 8, FS_NORMAL, FPF_ROMFONT };
 static const char *no_choices[] = { "", NULL };
@@ -783,6 +814,10 @@ struct Gui *gui_open(const char *title, const struct GuiItem *items, int nitems,
 		nw.BlockPen = 1;
 		nw.IDCMPFlags = IDCMP_CLOSEWINDOW | IDCMP_GADGETUP | IDCMP_GADGETDOWN |
 			IDCMP_MOUSEMOVE | IDCMP_MOUSEBUTTONS | IDCMP_VANILLAKEY | IDCMP_RAWKEY;
+		if (IntuitionBase->LibNode.lib_Version < 36 && open_console()) {
+			gui->convert_keys = TRUE;
+			nw.IDCMPFlags &= ~IDCMP_VANILLAKEY;
+		}
 		nw.Flags = WFLG_DRAGBAR | WFLG_DEPTHGADGET | WFLG_CLOSEGADGET |
 			WFLG_SMART_REFRESH | WFLG_NOCAREREFRESH | WFLG_ACTIVATE | WFLG_RMBTRAP;
 		nw.Title = (UBYTE *)title;
@@ -831,6 +866,8 @@ void gui_close(struct Gui *gui)
 		free_nodes(&gui->items[i]);
 	if (gui->font)
 		CloseFont(gui->font);
+	if (gui->convert_keys)
+		close_console();
 	if (gui->gt && --gadtools_users == 0)
 	{
 		CloseLibrary(GadToolsBase);
@@ -984,9 +1021,23 @@ BOOL gui_event(struct Gui *gui, struct GuiEvent *ev)
 			got = handle_key(gui, code, qual, ev);
 			break;
 		case IDCMP_RAWKEY:
-			/* Only the keys that are no characters come this way */
+			/* Only the keys that are no characters come this way (on
+			   1.3, all of them: those that are, become characters) */
 			if (!(code & IECODE_UP_PREFIX))
 			{
+				if (gui->convert_keys && !(code >= 0x4c && code <= 0x5f))
+				{
+					struct InputEvent ie;
+					UBYTE buf[8];
+					memset(&ie, 0, sizeof(ie));
+					ie.ie_Class = IECLASS_RAWKEY;
+					ie.ie_Code = code;
+					ie.ie_Qualifier = qual;
+					ie.ie_EventAddress = addr ? *(APTR *)addr : NULL;
+					if (RawKeyConvert(&ie, (STRPTR)buf, sizeof(buf), NULL) == 1)
+						got = handle_key(gui, buf[0], qual, ev);
+					break;
+				}
 				set_event(ev, GUI_EV_RAWKEY, 0, ((LONG)qual << 16) | code);
 				got = TRUE;
 			}
