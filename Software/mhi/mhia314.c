@@ -188,6 +188,7 @@ struct Decoder
 	ULONG unsent;			/* copied, not yet announced with DATA */
 	BOOL ring_sent;
 	BOOL stop_pending;		/* STOP sent, STOPPED not yet back */
+	BOOL poll_due;			/* time for a POLL (if nothing else is sent) */
 	BOOL dry;			/* the Pi has decoded everything sent */
 
 	struct A314_IORequest read_ior, write_ior, reset_ior;
@@ -406,6 +407,7 @@ static void a314_cmd(struct Decoder *d, struct A314_IORequest *ior, UWORD cmd, U
 
 static void send_line(struct Decoder *d, char *end)
 {
+	d->poll_due = FALSE;		/* any line asks for what is ready */
 	a314_cmd(d, &d->write_ior, A314_WRITE, d->out_buf, end - (char *)d->out_buf);
 	d->write_pending = TRUE;
 }
@@ -791,17 +793,24 @@ static void send_next(struct Decoder *d)
 		send_line(d, put_str(p, d->want_play ? "PLAY" : "PAUSE"));
 		return;
 	}
+	/* The service only answers (it never sends by itself, so that it
+	   can't interrupt while WHDLoad has the machine): ask */
+	if (d->poll_due)
+		send_line(d, put_str(p, "POLL"));
 }
 
 /* ---------------------------------------------------------------------- */
 /* Connecting and disconnecting (worker)                                  */
 
+/* Once a second while connecting; every 0.1 s once connected, for the
+   POLLs */
 static void start_timer(struct MhiBase *base)
 {
 	if (base->timer_open && !base->timer_pending)
 	{
-		base->timer_req.tr_time.tv_secs = 1;
-		base->timer_req.tr_time.tv_micro = 0;
+		BOOL connected = base->dec.connected;
+		base->timer_req.tr_time.tv_secs = connected ? 0 : 1;
+		base->timer_req.tr_time.tv_micro = connected ? 100000 : 0;
 		SendIO((struct IORequest *)&base->timer_req);
 		base->timer_pending = TRUE;
 	}
@@ -838,6 +847,7 @@ static void handle_a314_reply(struct Decoder *d, struct A314_IORequest *ior)
 		{
 			d->connected = TRUE;
 			start_read(d);
+			start_timer(the_base);	/* for the POLLs */
 			ReplyMsg(&d->ctl->msg);	/* ok was set TRUE */
 			d->ctl = NULL;
 		}
@@ -917,10 +927,16 @@ static void start_free(struct Decoder *d, struct CtlMsg *cm)
 	d->connected = FALSE;
 }
 
-/* Once a second while connecting */
 static void tick(struct MhiBase *base)
 {
 	struct Decoder *d = &base->dec;
+	if (d->connected && !d->closing)
+	{
+		if (d->play_sent || d->used || d->stop_pending)
+			d->poll_due = TRUE;
+		start_timer(base);
+		return;
+	}
 	if (d->connecting && d->ctl)
 	{
 		if (--d->timeout == 0)
