@@ -97,7 +97,7 @@ struct Gui
 /* Workbench 1.3's Intuition sends no raw keys (such as the cursor keys)
    to a window that asks for characters too: there, a window asks only for
    raw keys, and console.device turns them into characters */
-struct Device *ConsoleDevice;
+static struct Device *ConsoleDevice;	/* its own: a tool may have one too */
 static struct IOStdReq console_io;
 static int console_users;
 
@@ -1025,7 +1025,8 @@ BOOL gui_event(struct Gui *gui, struct GuiEvent *ev)
 			   1.3, all of them: those that are, become characters) */
 			if (!(code & IECODE_UP_PREFIX))
 			{
-				if (gui->convert_keys && !(code >= 0x4c && code <= 0x5f))
+				/* the cursor keys, F1-F10 and Help stay raw keys */
+				if (gui->convert_keys && !((code >= 0x4c && code <= 0x59) || code == 0x5f))
 				{
 					struct InputEvent ie;
 					UBYTE buf[8];
