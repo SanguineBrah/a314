@@ -38,6 +38,13 @@
 #                           rate, 8 or 16 bits (big-endian), instead of
 #                           playing it through PiAudio; sent after RING
 #   FREE <slot>             the slot has been played and can be filled again
+#   POLL                    nothing to say: asks for what is ready
+#
+# The service only ever sends, or writes into the Amiga's slots, in answer
+# to a line from the Amiga (POLL when it has nothing else to say), never by
+# itself: while WHDLoad has the machine, anything sent would raise the A314
+# interrupt under the game. Meanwhile TAKEN amounts are added up, and only
+# the latest DRY and PIPE are kept.
 #
 # Pi -> Amiga:
 #   TAKEN <n>               n bytes of the ring were read and can be reused
@@ -266,6 +273,9 @@ class Player(object):
         self.params = {}
         self.out = None             # with OUT: (address, slot size, slots, bits)
         self.free = []              # slots that can be filled
+        self.queue = []             # lines for the next answer
+        self.taken = 0
+        self.answering = False
         self.decoder = None
         try:
             self.decoder = Decoder()
@@ -273,7 +283,31 @@ class Player(object):
             logger.error('Unable to start the decoder: %s', e)
 
     def send(self, line):
-        self.service.send(self.stream_id, line.encode('latin-1')[:MAX_LINE])
+        # Kept until the next answer to the Amiga
+        if line.startswith('TAKEN '):
+            self.taken += int(line.split()[1])
+            return
+        kind = line.split(' ', 1)[0]
+        if kind in ('DRY', 'PIPE'):
+            self.queue = [l for l in self.queue if l.split(' ', 1)[0] != kind]
+        self.queue.append(line)
+
+    def reply(self):
+        # The answer to a line from the Amiga: free slots are filled, and
+        # what is waiting is sent
+        self.answering = True
+        while True:
+            free = len(self.free)
+            self.decode()           # fills one slot at a time
+            if not self.free or len(self.free) == free:
+                break
+        self.answering = False
+        if self.taken:
+            self.service.send(self.stream_id, ('TAKEN %d' % self.taken).encode('latin-1'))
+            self.taken = 0
+        for line in self.queue:
+            self.service.send(self.stream_id, line.encode('latin-1')[:MAX_LINE])
+        self.queue = []
 
     def command(self, line):
         words = line.split()
@@ -310,6 +344,8 @@ class Player(object):
             self.set_param(nums[0], max(0, min(100, nums[1])))
         elif cmd == 'OUT' and len(nums) == 5:
             self.set_out(*nums)
+        elif cmd == 'POLL':
+            pass
         elif cmd == 'FREE' and len(nums) == 1 and self.out:
             if 0 <= nums[0] < self.out[2] and nums[0] not in self.free:
                 self.free.append(nums[0])
@@ -390,7 +426,7 @@ class Player(object):
             else:
                 starved = True
                 break
-        if self.out:
+        if self.out and self.answering:
             self.fill_slots(starved)
         # DRY once everything decoded has gone (to the pipe or the Amiga),
         # so that a player that stops at DRY doesn't cut the end off
@@ -487,6 +523,7 @@ class MhiService(object):
             return
         if ptype == A314d.MSG_DATA:
             player.command(payload.decode('latin-1'))
+            player.reply()
         elif ptype in (A314d.MSG_EOS, A314d.MSG_RESET):
             if ptype == A314d.MSG_EOS:
                 self.a314d.send_eos(stream_id)
