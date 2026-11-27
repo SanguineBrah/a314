@@ -487,6 +487,17 @@ void device_process_run()
 	a314_mp.mp_SigBit = AllocSignal(-1);
 	a314_mp.mp_SigTask = FindTask(NULL);
 
+	// A new process each time the device is opened: no state from the last
+	// one (a TCP/IP stack such as MiamiDX closes the device when it goes
+	// offline and opens it again to go online; the old process ended
+	// offline, and this one, taking that over, never asked for frames)
+	want_offline = FALSE;
+	offline = FALSE;
+	connection_lost = FALSE;
+	pending_a314_read = FALSE;
+	pending_a314_write = FALSE;
+	pending_a314_reset = FALSE;
+
 	do_a314_cmd(&reset_ior, A314_CONNECT, (char *)service_name, strlen(service_name));
 	device_start_error = reset_ior.a314_Request.io_Error == A314_CONNECT_OK ? 0 : -1;
 
