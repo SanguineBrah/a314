@@ -658,12 +658,17 @@ void action_examine_object(struct DosPacket *dp)
 	else
 	{
 		int nlen = (unsigned char)(res->data[0]);
-		memcpy(fib->fib_FileName, res->data, nlen + 1);
-		fib->fib_FileName[nlen + 1] = 0;
+		// Within the FileInfoBlock, whatever the Pi sent
+		int nl = nlen > sizeof(fib->fib_FileName) - 2 ? sizeof(fib->fib_FileName) - 2 : nlen;
+		memcpy(fib->fib_FileName, res->data, nl + 1);
+		fib->fib_FileName[0] = nl;
+		fib->fib_FileName[nl + 1] = 0;
 
 		int clen = (unsigned char)(res->data[nlen + 1]);
-		memcpy(fib->fib_Comment, &(res->data[nlen + 1]), clen + 1);
-		fib->fib_Comment[clen + 1] = 0;
+		int cl = clen > sizeof(fib->fib_Comment) - 2 ? sizeof(fib->fib_Comment) - 2 : clen;
+		memcpy(fib->fib_Comment, &(res->data[nlen + 1]), cl + 1);
+		fib->fib_Comment[0] = cl;
+		fib->fib_Comment[cl + 1] = 0;
 
 		fib->fib_DiskKey = res->disk_key;
 		fib->fib_DirEntryType = res->entry_type;
@@ -709,12 +714,17 @@ void action_examine_next(struct DosPacket *dp)
 	else
 	{
 		int nlen = (unsigned char)(res->data[0]);
-		memcpy(fib->fib_FileName, res->data, nlen + 1);
-		fib->fib_FileName[nlen + 1] = 0;
+		// Within the FileInfoBlock, whatever the Pi sent
+		int nl = nlen > sizeof(fib->fib_FileName) - 2 ? sizeof(fib->fib_FileName) - 2 : nlen;
+		memcpy(fib->fib_FileName, res->data, nl + 1);
+		fib->fib_FileName[0] = nl;
+		fib->fib_FileName[nl + 1] = 0;
 
 		int clen = (unsigned char)(res->data[nlen + 1]);
-		memcpy(fib->fib_Comment, &(res->data[nlen + 1]), clen + 1);
-		fib->fib_Comment[clen + 1] = 0;
+		int cl = clen > sizeof(fib->fib_Comment) - 2 ? sizeof(fib->fib_Comment) - 2 : clen;
+		memcpy(fib->fib_Comment, &(res->data[nlen + 1]), cl + 1);
+		fib->fib_Comment[0] = cl;
+		fib->fib_Comment[cl + 1] = 0;
 
 		fib->fib_DiskKey = res->disk_key;
 		fib->fib_DirEntryType = res->entry_type;
@@ -759,12 +769,17 @@ void action_examine_fh(struct DosPacket *dp)
 	else
 	{
 		int nlen = (unsigned char)(res->data[0]);
-		memcpy(fib->fib_FileName, res->data, nlen + 1);
-		fib->fib_FileName[nlen + 1] = 0;
+		// Within the FileInfoBlock, whatever the Pi sent
+		int nl = nlen > sizeof(fib->fib_FileName) - 2 ? sizeof(fib->fib_FileName) - 2 : nlen;
+		memcpy(fib->fib_FileName, res->data, nl + 1);
+		fib->fib_FileName[0] = nl;
+		fib->fib_FileName[nl + 1] = 0;
 
 		int clen = (unsigned char)(res->data[nlen + 1]);
-		memcpy(fib->fib_Comment, &(res->data[nlen + 1]), clen + 1);
-		fib->fib_Comment[clen + 1] = 0;
+		int cl = clen > sizeof(fib->fib_Comment) - 2 ? sizeof(fib->fib_Comment) - 2 : clen;
+		memcpy(fib->fib_Comment, &(res->data[nlen + 1]), cl + 1);
+		fib->fib_Comment[0] = cl;
+		fib->fib_Comment[cl + 1] = 0;
 
 		fib->fib_DiskKey = res->disk_key;
 		fib->fib_DirEntryType = res->entry_type;
