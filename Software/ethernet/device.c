@@ -123,6 +123,14 @@ struct A314_IORequest reset_ior;
 BOOL pending_a314_read;
 BOOL pending_a314_write;
 BOOL pending_a314_reset;
+BOOL connection_lost;      // the stream was reset by the Pi side
+
+// Offline (S2_OFFLINE), the stream to the ethernet service is closed, so
+// that the Pi forgets the read buffers it was given and sends nothing (not
+// even an interrupt) until the device is online again: e.g. while WHDLoad
+// has the machine, with the TCP/IP stack put offline around it.
+volatile BOOL want_offline;
+BOOL offline;
 
 struct ServiceMsg a314_read_buf;
 struct ServiceMsg a314_write_buf;
@@ -293,7 +301,8 @@ static void handle_a314_reply(struct A314_IORequest *ior)
 		}
 		else // A314_WRITE_RESET
 		{
-			// TODO: Handle. What if pi-side is shutting down.
+			// The ethernet service went away (e.g. a314d restarted)
+			connection_lost = TRUE;
 		}
 	}
 	else if (ior == &read_ior)
@@ -319,13 +328,48 @@ static void handle_a314_reply(struct A314_IORequest *ior)
 		}
 		else // A314_READ_RESET
 		{
-			// TODO: Handle. What if pi-side is shutting down.
+			connection_lost = TRUE;
 		}
 	}
 	else if (ior == &reset_ior)
 	{
 		pending_a314_reset = FALSE;
 	}
+}
+
+static void move_all(struct List *from, struct List *to)
+{
+	struct Node *n;
+	while ((n = RemHead(from)))
+		AddTail(to, n);
+}
+
+// After the stream was reset (e.g. a314d was restarted), when nothing is
+// pending any more: the frames that were with the Pi are lost (as on a
+// glitch of a real network), their buffers are free again, and the device
+// connects to the ethernet service again, every two seconds until it is
+// there (or the device is closed). FALSE if it is to shut down instead.
+static BOOL reconnect(ULONG shutdown_sigmask)
+{
+	move_all(&et_rbuf_pending_list, &et_rbuf_free_list);
+	move_all(&et_wbuf_pending_list, &et_wbuf_free_list);
+
+	while (TRUE)
+	{
+		do_a314_cmd(&reset_ior, A314_RESET, NULL, 0);
+		do_a314_cmd(&reset_ior, A314_CONNECT, (char *)service_name, strlen(service_name));
+		if (reset_ior.a314_Request.io_Error == A314_CONNECT_OK)
+			break;
+		if (SetSignal(0, 0) & shutdown_sigmask)
+			return FALSE;
+		Delay(100);
+	}
+
+	connection_lost = FALSE;
+	last_req_kind = 0;
+	send_a314_cmd(&read_ior, A314_READ, (void *)&a314_read_buf, sizeof(a314_read_buf));
+	pending_a314_read = TRUE;
+	return TRUE;
 }
 
 static struct IOSana2Req *remove_matching_rbuf(ULONG type)
@@ -443,6 +487,17 @@ void device_process_run()
 	a314_mp.mp_SigBit = AllocSignal(-1);
 	a314_mp.mp_SigTask = FindTask(NULL);
 
+	// A new process each time the device is opened: no state from the last
+	// one (a TCP/IP stack such as MiamiDX closes the device when it goes
+	// offline and opens it again to go online; the old process ended
+	// offline, and this one, taking that over, never asked for frames)
+	want_offline = FALSE;
+	offline = FALSE;
+	connection_lost = FALSE;
+	pending_a314_read = FALSE;
+	pending_a314_write = FALSE;
+	pending_a314_reset = FALSE;
+
 	do_a314_cmd(&reset_ior, A314_CONNECT, (char *)service_name, strlen(service_name));
 	device_start_error = reset_ior.a314_Request.io_Error == A314_CONNECT_OK ? 0 : -1;
 
@@ -460,8 +515,37 @@ void device_process_run()
 
 	while (TRUE)
 	{
+		if (want_offline && !offline && !shutting_down)
+		{
+			offline = TRUE;
+			if (!connection_lost)
+			{
+				// The pending read and write end with a reset
+				send_a314_cmd(&reset_ior, A314_RESET, NULL, 0);
+				pending_a314_reset = TRUE;
+			}
+		}
+		else if (!want_offline && offline && !pending_a314_reset)
+		{
+			offline = FALSE;
+			connection_lost = TRUE;     // connect again, below
+		}
+
+		if (connection_lost && !offline && !shutting_down && !pending_a314_read &&
+			!pending_a314_write && !pending_a314_reset)
+		{
+			if (!reconnect(shutdown_sigmask))
+			{
+				// Closed meanwhile: nothing is pending, the stream is reset
+				shutting_down = TRUE;
+				connection_lost = FALSE;
+				continue;
+			}
+		}
+
 		complete_read_reqs();
-		maybe_write_req();
+		if (!connection_lost && !offline)
+			maybe_write_req();
 
 		if (shutting_down && !pending_a314_read && !pending_a314_write && !pending_a314_reset)
 			break;
@@ -470,8 +554,13 @@ void device_process_run()
 
 		if ((sigs & shutdown_sigmask) && !shutting_down)
 		{
-			send_a314_cmd(&reset_ior, A314_RESET, NULL, 0);
-			pending_a314_reset = TRUE;
+			// (Not while a reset for going offline is still under way: the
+			// request can't be sent twice; that one closes the stream too.)
+			if (!pending_a314_reset)
+			{
+				send_a314_cmd(&reset_ior, A314_RESET, NULL, 0);
+				pending_a314_reset = TRUE;
+			}
 			shutting_down = TRUE;
 		}
 
@@ -762,10 +851,14 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2
 	case S2_ONLINE:
 		set_last_start();
 		is_online = TRUE;
+		want_offline = FALSE;
+		Signal(&device_process->pr_Task, sana2_sigmask);
 		break;
 
 	case S2_OFFLINE:
 		is_online = FALSE;
+		want_offline = TRUE;
+		Signal(&device_process->pr_Task, sana2_sigmask);
 		break;
 
 	case S2_GETSTATIONADDRESS:
